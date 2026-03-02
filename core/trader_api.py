@@ -237,6 +237,96 @@ class AsyncKisAPI:
             
         return pd.DataFrame()
 
+    async def get_ohlcv_by_range(
+        self,
+        ticker: str,
+        start_date: str,
+        end_date: str,
+        period_code: str = "D",
+        market_code: str = "J",
+    ) -> pd.DataFrame:
+        """
+        날짜 범위 지정 OHLCV 수집 (TR: FHKST03010100).
+
+        이슈 #1 명세에 따른 백테스팅 전용 메서드.
+        1회 호출에 최대 100건 반환 → 범위가 크면 100일 단위로 청크 분할 후 병합.
+
+        Args:
+            ticker: 종목코드 (예: "005930")
+            start_date: 조회 시작일 "YYYYMMDD"
+            end_date: 조회 종료일 "YYYYMMDD"
+            period_code: "D"(일봉), "W"(주봉), "M"(월봉)
+            market_code: "J"(KRX 기본)
+
+        Returns:
+            pd.DataFrame: date/open/high/low/close/volume/amount 정렬된 DataFrame
+        """
+        col_map = {
+            "stck_bsop_date": "date",
+            "stck_oprc": "open",
+            "stck_hgpr": "high",
+            "stck_lwpr": "low",
+            "stck_clpr": "close",
+            "acml_vol": "volume",
+            "acml_tr_pbmn": "amount",
+        }
+
+        start_dt = datetime.strptime(start_date, "%Y%m%d")
+        end_dt = datetime.strptime(end_date, "%Y%m%d")
+        all_frames: List[pd.DataFrame] = []
+
+        # 100일 청크 단위로 분할 (영업일 기준 약 70일 = 달력 100일)
+        chunk_days = 100
+        chunk_end = end_dt
+        while chunk_end >= start_dt:
+            chunk_start = max(start_dt, chunk_end - timedelta(days=chunk_days))
+            params = {
+                "FID_COND_MRKT_DIV_CODE": market_code,
+                "FID_INPUT_ISCD": ticker,
+                "FID_INPUT_DATE_1": chunk_start.strftime("%Y%m%d"),
+                "FID_INPUT_DATE_2": chunk_end.strftime("%Y%m%d"),
+                "FID_PERIOD_DIV_CODE": period_code,
+                "FID_ORG_ADJ_PRC": "0",  # 수정주가
+            }
+            res = await self._fetch(
+                "GET",
+                "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+                "FHKST03010100",
+                params=params,
+            )
+            data_list = res.get("output2")
+            if res.get("rt_cd") == "0" and data_list:
+                df_chunk = pd.DataFrame(data_list)
+                df_chunk.rename(columns=col_map, inplace=True)
+                cols = ["date", "open", "high", "low", "close", "volume", "amount"]
+                for c in cols[1:]:
+                    if c in df_chunk.columns:
+                        df_chunk[c] = pd.to_numeric(df_chunk[c], errors="coerce")
+                if "amount" not in df_chunk.columns or df_chunk["amount"].isnull().all():
+                    df_chunk["amount"] = df_chunk["close"] * df_chunk["volume"]
+                df_chunk = df_chunk[[c for c in cols if c in df_chunk.columns]]
+                df_chunk["date"] = pd.to_datetime(df_chunk["date"], format="%Y%m%d", errors="coerce")
+                all_frames.append(df_chunk)
+            else:
+                logger.warning(f"[{ticker}] FHKST03010100 청크 실패 ({chunk_start.strftime('%Y%m%d')}~{chunk_end.strftime('%Y%m%d')}): {res.get('msg1','')}")
+
+            chunk_end = chunk_start - timedelta(days=1)
+            if chunk_end < start_dt:
+                break
+
+        if not all_frames:
+            logger.error(f"[{ticker}] get_ohlcv_by_range: 수집된 데이터 없음")
+            return pd.DataFrame()
+
+        result = (
+            pd.concat(all_frames, ignore_index=True)
+            .drop_duplicates(subset=["date"])
+            .sort_values("date")
+            .reset_index(drop=True)
+        )
+        logger.info(f"[{ticker}] get_ohlcv_by_range: {len(result)}행 수집 ({start_date}~{end_date})")
+        return result
+
     async def get_current_price(self, ticker: str) -> Optional[int]:
         """Get the current price asynchronously."""
         params = {

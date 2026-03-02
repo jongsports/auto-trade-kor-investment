@@ -114,22 +114,30 @@ class BacktestDataCollector:
     async def _fetch_from_api(
         self, ticker: str, start_date: str, end_date: str
     ) -> pd.DataFrame:
-        """KIS API에서 OHLCV 수집 (내부 비동기 메서드)."""
+        """
+        KIS API에서 OHLCV 수집 (TR: FHKST03010100).
+
+        이슈 #1 명세에 따라 inquire-daily-itemchartprice 엔드포인트 사용.
+        지표 워밍업을 위해 start_date보다 200일 이전부터 수집합니다.
+        """
         try:
-            # 지표 계산을 위해 start보다 200일 이전부터 수집
+            # 지표 계산 워밍업: 시작일 200일(달력) 이전부터 수집
             fetch_start = (
                 pd.to_datetime(start_date) - timedelta(days=200)
-            ).strftime("%Y-%m-%d")
+            ).strftime("%Y%m%d")
+            fetch_end = pd.to_datetime(end_date).strftime("%Y%m%d")
 
-            # get_ohlcv는 고정 start_date="20240101"을 사용하는 구현이므로
-            # 여기서는 count를 크게 설정해서 충분한 과거 데이터를 가져옴
-            df = await self.api_client.get_ohlcv(ticker, period_code="D", count=600)
+            df = await self.api_client.get_ohlcv_by_range(
+                ticker=ticker,
+                start_date=fetch_start,
+                end_date=fetch_end,
+                period_code="D",
+            )
 
             if df.empty:
                 logger.warning(f"[{ticker}] API 반환 데이터 없음")
                 return pd.DataFrame()
 
-            df = df.sort_values("date").reset_index(drop=True)
             logger.info(f"[{ticker}] API 수집 완료: {len(df)}행")
             return df
 
