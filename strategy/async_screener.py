@@ -422,7 +422,7 @@ class AsyncStockScreener:
     # ------------------------------------------------------------------
 
     async def _process_ticker(self, ticker: str, market: str) -> dict:
-        """단일 종목 비동기 처리: OHLCV → 수급 → 뉴스 → 점수 → 반환."""
+        """단일 종목 비동기 처리: OHLCV → 종목명 → 수급 → 뉴스 → 점수 → 반환."""
         try:
             now_str = datetime.now().strftime("%H:%M")
             is_overnight_window = config.OVERNIGHT_BUY_START <= now_str <= config.OVERNIGHT_BUY_END
@@ -440,21 +440,35 @@ class AsyncStockScreener:
 
             logger.info(f"[{ticker}] 데이터 준비 ({len(ohlcv_data)}행)")
 
-            # 2. 수급 조회 (OHLCV 성공 시만 — API 호출 절약)
+            # 2. 현재가 및 종목명 조회 (뉴스 분석에 실제 종목명 필요)
+            mrkt_code = "J" if market == "KOSPI" else "K"
+            params    = {"FID_COND_MRKT_DIV_CODE": mrkt_code, "FID_INPUT_ISCD": ticker}
+            info_res  = await self.api_client._fetch(
+                "GET", "/uapi/domestic-stock/v1/quotations/inquire-price", "FHKST01010100",
+                params=params
+            )
+            if info_res.get("rt_cd") == "0" and "output" in info_res:
+                current_price = int(info_res["output"].get("stck_prpr", 0))
+                stock_name    = info_res["output"].get("hts_kor_isnm", f"STK_{ticker}")
+            else:
+                current_price = int(ohlcv_data["close"].iloc[-1])
+                stock_name    = f"STK_{ticker}"
+
+            # 3. 수급 조회
             investor_trend = await self.api_client.get_investor_trend(ticker)
 
-            # 3. 뉴스 점수 (news_analyzer 없으면 스킵)
+            # 4. 뉴스 점수 (news_analyzer 없으면 스킵)
             news_score_raw = 0.0
             if self.news_analyzer is not None:
                 try:
-                    stock_name  = f"STK_{ticker}"
-                    news_result = await self.news_analyzer.analyze_stock_news(ticker, stock_name, days=1)
-                    raw         = news_result.get("score", 0.0)
-                    news_score_raw = min(10.0, max(0.0, float(raw) * 0.5))
+                    news_result    = await self.news_analyzer.analyze_stock_news(
+                        ticker, stock_name, days=1
+                    )
+                    news_score_raw = float(news_result.get("score", 0.0))
                 except Exception as e:
                     logger.debug(f"[{ticker}] 뉴스 분석 실패 (비필수): {e}")
 
-            # 4. 100점 스코어링
+            # 5. 100점 스코어링
             score_dict = self.calculate_stock_score(
                 ticker=ticker,
                 ohlcv_data=ohlcv_data,
@@ -471,28 +485,12 @@ class AsyncStockScreener:
                 f"야간보너스:{score_dict['overnight_bonus']} | 총점:{total_score}"
             )
 
-            # 5. 세션별 임계값 필터
+            # 6. 세션별 임계값 필터
             threshold = self.get_entry_threshold(is_overnight_window)
             if total_score < threshold:
                 return {}
 
-            # 6. 현재가 및 종목명 조회
-            mrkt_code = "J" if market == "KOSPI" else "K"
-            params    = {"FID_COND_MRKT_DIV_CODE": mrkt_code, "FID_INPUT_ISCD": ticker}
-            info_res  = await self.api_client._fetch(
-                "GET", "/uapi/domestic-stock/v1/quotations/inquire-price", "FHKST01010100",
-                params=params
-            )
-
-            if info_res.get("rt_cd") == "0" and "output" in info_res:
-                current_price = int(info_res["output"].get("stck_prpr", 0))
-                stock_name    = info_res["output"].get("hts_kor_isnm", f"STK_{ticker}")
-            else:
-                current_price = int(ohlcv_data["close"].iloc[-1])
-                stock_name    = f"STK_{ticker}"
-
             return {
-                # 기존 인터페이스 유지
                 "ticker":  ticker,
                 "name":    stock_name,
                 "score":   total_score,
@@ -500,7 +498,6 @@ class AsyncStockScreener:
                 "reason":  "Overnight" if is_overnight_window else "Momentum",
                 "market":  market,
                 "source":  "confluence",
-                # 추가 정보 (하위 호환 — 기존 코드는 무시 가능)
                 "score_breakdown":     score_dict,
                 "foreign_net_buy":     investor_trend.get("foreign_net_buy", 0),
                 "institution_net_buy": investor_trend.get("institution_net_buy", 0),

@@ -27,6 +27,7 @@ class AsyncAutoTrader:
         )
         self.screener = AsyncStockScreener(self.api_client)
         self.news_analyzer = AsyncNewsAnalyzer(self.api_client)
+        self.screener.news_analyzer = self.news_analyzer  # 뉴스 분석기 주입
         self.notifier = AsyncTelegramNotifier()
         
         # Note: In a fully refactored system, RiskManager and TradingStrategy should also be async.
