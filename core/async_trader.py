@@ -92,20 +92,31 @@ class AsyncAutoTrader:
             now = datetime.now()
             # Only monitor during market hours (09:00 - 15:30)
             if 9 <= now.hour < 15 or (now.hour == 15 and now.minute <= 30):
-                # 1. Price/Position monitoring (Every 10 seconds)
-                # In real scenario: self.strategy.check_and_execute_orders_async()
-                logger.debug("Checking positions...")
-                
-                # 2. News monitoring (Every 30 mins)
+                # 1. 보유 포지션 청산 조건 체크 (매 10초)
+                await self._check_exit_conditions()
+
+                # 2. 뉴스 모니터링 (30분마다) - run_screening_async로 긴급 뉴스 추출
                 if now.minute in [0, 30] and now.second < 10:
                     logger.info("Background news monitoring...")
-                    news_candidates = await self.screener.analyze_news_for_candidates(days=0.04)
-                    if news_candidates:
-                         urgent_news = [s for s in news_candidates if s["score"] > 80]
-                         if urgent_news:
-                              logger.warning(f"긴급 뉴스 발견: {len(urgent_news)}건")
-                              # Handle urgent news
-                              
+                    try:
+                        # 현재 후보 종목 뉴스 긴급도 재분석
+                        if self.candidate_stocks and self.screener.news_analyzer:
+                            urgent = []
+                            for c in self.candidate_stocks[:10]:
+                                ticker = c.get("ticker", "")
+                                name = c.get("name", ticker)
+                                if not ticker:
+                                    continue
+                                news_res = await self.screener.news_analyzer.analyze_stock_news(
+                                    ticker, name, days=0.04
+                                )
+                                if news_res.get("score", 0) >= 8:
+                                    urgent.append({"ticker": ticker, "news_score": news_res["score"]})
+                            if urgent:
+                                logger.warning(f"긴급 뉴스 발견: {len(urgent)}건 {urgent}")
+                    except Exception as e:
+                        logger.error(f"뉴스 모니터링 오류: {e}")
+
             await asyncio.sleep(10)
 
     async def _run_screening(self):
@@ -135,15 +146,46 @@ class AsyncAutoTrader:
         except Exception as e:
             logger.error(f"스크리닝 결과 저장 중 오류 발생: {e}")
 
+    async def _check_exit_conditions(self):
+        """보유 포지션 청산 조건 체크 및 실행."""
+        if not self.strategy.holdings:
+            return
+        for ticker in list(self.strategy.holdings.keys()):
+            try:
+                should_exit, reason = await self.strategy.check_exit_condition(ticker)
+                if should_exit:
+                    logger.info(f"[청산신호] {ticker}: {reason}")
+                    await self.strategy.exit(ticker, reason=reason)
+                    await self.notifier.send_message(
+                        f"📤 <b>청산</b> {ticker}\n사유: {reason}"
+                    )
+            except Exception as e:
+                logger.error(f"청산 조건 체크 오류 {ticker}: {e}")
+
     async def _morning_entry(self):
-        # A full async wrapper to replace the _morning_entry
+        """시초가 매매: 상위 후보 종목 매수 실행."""
         logger.info("시초가 매매 로직 실행")
         if not self.candidate_stocks:
-             return
-             
-        top = self.candidate_stocks[:3]
+            return
+
+        # 장 진입 가능 여부 사전 체크
+        await self.strategy.update_holdings()
+
+        top = self.candidate_stocks[:config.MAX_STOCKS]
         for c in top:
-            ticker = c["ticker"]
-            # To avoid blocking, run strategy logic in thread pool if it's strictly sync
-            # await asyncio.to_thread(self.strategy.entry, ticker)
-            logger.info(f"매수 시도: {ticker}")
+            ticker = c.get("ticker", "")
+            reason = c.get("reason", "Momentum")
+            if not ticker:
+                continue
+            try:
+                ohlcv = await self.api_client.get_ohlcv(ticker, count=30)
+                if not ohlcv.empty:
+                    can_enter = await self.strategy.check_entry_condition(ticker, ohlcv)
+                    if can_enter:
+                        result = await self.strategy.entry(ticker, reason=reason)
+                        if result and result.get("rt_cd") == "0":
+                            await self.notifier.send_message(
+                                f"📈 <b>매수</b> {ticker} ({reason})"
+                            )
+            except Exception as e:
+                logger.error(f"시초가 매수 오류 {ticker}: {e}")

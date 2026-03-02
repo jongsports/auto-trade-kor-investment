@@ -355,21 +355,96 @@ class AsyncKisAPI:
             "CTX_AREA_FK100": "",
             "CTX_AREA_NK100": ""
         }
-        
+
         tr_id = "VTTC8434R" if self.demo_mode else "TTTC8434R"
         res = await self._fetch("GET", "/uapi/domestic-stock/v1/trading/inquire-balance", tr_id, params=params)
-        
+
         if res.get("rt_cd") == "0" and "output2" in res:
             summary = res["output2"][0]
-            positions = res.get("output1", [])
-            
+            raw_positions = res.get("output1", [])
+
+            # KIS output1 필드명을 내부 표준 필드명으로 정규화
+            positions = []
+            for p in raw_positions:
+                qty = int(p.get("hldg_qty", 0) or 0)
+                if qty <= 0:
+                    continue  # 보유수량 0인 종목 제외
+                positions.append({
+                    "ticker": p.get("pdno", ""),
+                    "name": p.get("prdt_name", ""),
+                    "quantity": qty,
+                    "buy_price": float(p.get("pchs_avg_pric", 0) or 0),
+                    "current_price": int(p.get("prpr", 0) or 0),
+                    "eval_profit_loss": int(p.get("evlu_pfls_amt", 0) or 0),
+                })
+
             return {
                 "total_evaluated_amount": int(summary.get("tot_evlu_amt", 0)),
-                "available_amount": int(summary.get("dnca_tot_amt", 0)), # 예수금
+                "available_amount": int(summary.get("dnca_tot_amt", 0)),  # 예수금
                 "positions": positions
             }
-            
+
         return {}
+
+    async def market_buy(self, ticker: str, quantity: int) -> Dict[str, Any]:
+        """시장가 매수 주문.
+
+        TR_ID: TTTC0012U (실전), VTTC0012U (모의)
+        ORD_DVSN "01" = 시장가
+        """
+        tr_id = "VTTC0012U" if self.demo_mode else "TTTC0012U"
+        body = {
+            "CANO": self.account_number[:8],
+            "ACNT_PRDT_CD": self.account_number[8:10],
+            "PDNO": ticker,
+            "ORD_DVSN": "01",       # 시장가
+            "ORD_QTY": str(quantity),
+            "ORD_UNPR": "0",        # 시장가 주문은 0
+            "EXCG_ID_DVSN_CD": "KRX",
+            "SLL_TYPE": "",
+            "CNDT_PRIC": "",
+        }
+        res = await self._fetch(
+            "POST",
+            "/uapi/domestic-stock/v1/trading/order-cash",
+            tr_id,
+            json=body,
+        )
+        if res.get("rt_cd") == "0":
+            logger.info(f"[매수완료] {ticker} {quantity}주 | 주문번호: {res.get('output', {}).get('odno', '')}")
+        else:
+            logger.error(f"[매수실패] {ticker} {quantity}주 | {res.get('msg1', '')}")
+        return res
+
+    async def market_sell(self, ticker: str, quantity: int) -> Dict[str, Any]:
+        """시장가 매도 주문.
+
+        TR_ID: TTTC0011U (실전), VTTC0011U (모의)
+        ORD_DVSN "01" = 시장가
+        """
+        tr_id = "VTTC0011U" if self.demo_mode else "TTTC0011U"
+        body = {
+            "CANO": self.account_number[:8],
+            "ACNT_PRDT_CD": self.account_number[8:10],
+            "PDNO": ticker,
+            "ORD_DVSN": "01",       # 시장가
+            "ORD_QTY": str(quantity),
+            "ORD_UNPR": "0",
+            "EXCG_ID_DVSN_CD": "KRX",
+            "SLL_TYPE": "01",       # 일반매도
+            "CNDT_PRIC": "",
+        }
+        res = await self._fetch(
+            "POST",
+            "/uapi/domestic-stock/v1/trading/order-cash",
+            tr_id,
+            json=body,
+        )
+        if res.get("rt_cd") == "0":
+            logger.info(f"[매도완료] {ticker} {quantity}주 | 주문번호: {res.get('output', {}).get('odno', '')}")
+        else:
+            logger.error(f"[매도실패] {ticker} {quantity}주 | {res.get('msg1', '')}")
+        return res
         
     async def get_investor_trend(self, ticker: str) -> Dict[str, Any]:
         """

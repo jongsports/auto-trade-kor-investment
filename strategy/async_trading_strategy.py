@@ -62,33 +62,32 @@ class AsyncTradingStrategy:
          status = get_trading_time_status()
          if status not in ["REGULAR", "OPENING_AUCTION"]:
               return False
-              
+
          if ticker in self.holdings: return False
          if len(self.holdings) >= self.max_stocks: return False
-         
+
          if ohlcv_data.empty or len(ohlcv_data) < 20: return False
-         
+
          # Entry Logic: Dip buying or strong momentum
-         # Calculate 5-day and 20-day MA
          ma5 = ohlcv_data["close"].rolling(5).mean().iloc[-1]
          ma20 = ohlcv_data["close"].rolling(20).mean().iloc[-1]
          current_price = ohlcv_data["close"].iloc[-1]
-         
-         # Calculate RSI 14
+
+         # RSI 14 - Wilder's smoothing (screener와 일관성 유지)
          delta = ohlcv_data["close"].diff()
-         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+         gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
+         loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
          rs = gain / loss
-         rsi14 = 100 - (100 / (1 + rs)).iloc[-1]
-         
+         rsi14 = (100 - (100 / (1 + rs))).iloc[-1]
+
          # Condition A: Strong momentum pullback (RSI between 40 and 60, price bounded by MAs)
          if ma20 < current_price < ma5 and 40 <= rsi14 <= 60:
              return True
-             
+
          # Condition B: Oversold bounce (RSI < 30)
          if rsi14 < 30:
              return True
-             
+
          return False
 
     async def check_exit_condition(self, ticker: str) -> tuple[bool, str]:
@@ -123,10 +122,13 @@ class AsyncTradingStrategy:
               return False, "Hold Overnight"
               
          # --- 2. MOMENTUM / DAY TRADE LOGIC ---
-         # For momentum, we want a tighter, faster trailing stop
-         trailing_threshold = self.trailing_stop if strategy_type == "Standard" else 0.02
-         take_profit_threshold = self.take_profit_ratio if strategy_type == "Standard" else 0.03
-         max_holding_days = 5 if strategy_type == "Standard" else 1
+         # 스크리너는 "Overnight" 또는 "Momentum"을 반환; "Standard"는 반환하지 않음
+         # "Momentum": 짧은 trailing stop, 짧은 보유 기간
+         # 그 외(Momentum 포함): config 기본값 사용
+         is_momentum = (strategy_type == "Momentum")
+         trailing_threshold = 0.02 if is_momentum else self.trailing_stop
+         take_profit_threshold = 0.03 if is_momentum else self.take_profit_ratio
+         max_holding_days = 1 if is_momentum else 5
 
          # Take Profit
          if profit_ratio >= take_profit_threshold:
@@ -156,14 +158,96 @@ class AsyncTradingStrategy:
               
          return False, "Hold"
 
-    async def entry(self, ticker: str, quantity: int=0, price: int=0):
-         # Skipping complex compliance check for brevity
-         logger.info(f"Submitting async MARKET BUY order for {ticker}")
-         
-         # Assuming a limit/market buy abstraction exists on api_client in prod
-         # order_result = await self.api_client.market_buy(ticker, quantity)
-         pass
+    async def entry(self, ticker: str, quantity: int = 0, price: int = 0,
+                    reason: str = "Momentum"):
+        """시장가 매수 주문 실행.
 
-    async def exit(self, ticker: str, quantity: int=0, reason: str=""):
-         logger.info(f"Submitting async MARKET SELL order for {ticker}: {reason}")
-         pass    
+        quantity가 0이면 리스크 매니저로 수량 자동 계산.
+        """
+        can, msg = await self.risk_manager.can_trade(ticker, "buy", quantity, price)
+        if not can:
+            logger.warning(f"[매수거부] {ticker}: {msg}")
+            return None
+
+        if ticker in self.holdings:
+            logger.warning(f"[매수거부] {ticker}: 이미 보유 중")
+            return None
+
+        # 수량이 지정되지 않은 경우 리스크 기반 자동 산정
+        if quantity <= 0:
+            account = await self.api_client.get_account_summary()
+            available = account.get("available_amount", 0)
+            if available <= 0:
+                logger.warning(f"[매수거부] {ticker}: 가용 잔고 없음")
+                return None
+            position_amount = await self.risk_manager.calculate_position_size(ticker, available)
+            current_price = await self.api_client.get_current_price(ticker)
+            if not current_price or current_price <= 0:
+                logger.warning(f"[매수거부] {ticker}: 현재가 조회 실패")
+                return None
+            quantity = max(1, int(position_amount // current_price))
+
+        if quantity <= 0:
+            logger.warning(f"[매수거부] {ticker}: 수량 0")
+            return None
+
+        logger.info(f"[매수시도] {ticker} {quantity}주 (reason={reason})")
+        result = await self.api_client.market_buy(ticker, quantity)
+
+        if result.get("rt_cd") == "0":
+            current_price = await self.api_client.get_current_price(ticker)
+            self.holdings[ticker] = {
+                "ticker": ticker,
+                "quantity": quantity,
+                "buy_price": current_price or price,
+                "current_price": current_price or price,
+                "high_price": current_price or price,
+                "entry_time": datetime.now(),
+                "reason": reason,
+            }
+            self.order_history.append({
+                "action": "BUY",
+                "ticker": ticker,
+                "quantity": quantity,
+                "price": current_price or price,
+                "time": datetime.now().isoformat(),
+                "reason": reason,
+            })
+        return result
+
+    async def exit(self, ticker: str, quantity: int = 0, reason: str = ""):
+        """시장가 매도 주문 실행."""
+        if ticker not in self.holdings:
+            logger.warning(f"[매도거부] {ticker}: 미보유 종목")
+            return None
+
+        held_qty = self.holdings[ticker].get("quantity", 0)
+        if held_qty <= 0:
+            logger.warning(f"[매도거부] {ticker}: 보유수량 0")
+            return None
+
+        sell_qty = quantity if quantity > 0 else held_qty
+
+        can, msg = await self.risk_manager.can_trade(ticker, "sell", sell_qty, 0)
+        if not can:
+            logger.warning(f"[매도거부] {ticker}: {msg}")
+            return None
+
+        logger.info(f"[매도시도] {ticker} {sell_qty}주 (reason={reason})")
+        result = await self.api_client.market_sell(ticker, sell_qty)
+
+        if result.get("rt_cd") == "0":
+            current_price = await self.api_client.get_current_price(ticker)
+            buy_price = self.holdings[ticker].get("buy_price", 0)
+            profit_ratio = (current_price / buy_price - 1) if buy_price > 0 and current_price else 0
+            self.order_history.append({
+                "action": "SELL",
+                "ticker": ticker,
+                "quantity": sell_qty,
+                "price": current_price or 0,
+                "time": datetime.now().isoformat(),
+                "reason": reason,
+                "profit_ratio": profit_ratio,
+            })
+            del self.holdings[ticker]
+        return result
