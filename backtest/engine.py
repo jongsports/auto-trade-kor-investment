@@ -31,7 +31,7 @@ class BacktestConfig:
     initial_capital: float = config.BACKTEST_INITIAL_CAPITAL
     commission: float = config.BACKTEST_COMMISSION      # 편도 수수료 (0.015%)
     slippage: float = config.BACKTEST_SLIPPAGE          # 슬리피지 (0.01%)
-    score_threshold: int = 55                            # 진입 최소 점수
+    score_threshold: int = 45                            # 진입 최소 점수 (수급 0 처리 시 최대=60, 45=75%)
     max_positions: int = config.MAX_STOCKS               # 최대 동시 보유 종목
     take_profit: float = config.TAKE_PROFIT_RATIO        # 익절 비율 (5%)
     stop_loss: float = config.STOP_LOSS_RATIO            # 손절 비율 (2%)

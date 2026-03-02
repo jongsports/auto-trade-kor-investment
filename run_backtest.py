@@ -64,8 +64,8 @@ def parse_args():
                         help="초기 자본금 (원)")
     parser.add_argument("--tickers", nargs="+", default=None,
                         help="테스트할 종목코드 목록 (예: 005930 000660)")
-    parser.add_argument("--threshold", type=int, default=55,
-                        help="진입 최소 스크리닝 점수 (기본 55)")
+    parser.add_argument("--threshold", type=int, default=45,
+                        help="진입 최소 스크리닝 점수 (기본 45; 수급 0 처리 시 최대=60)")
     parser.add_argument("--commission", type=float, default=config.BACKTEST_COMMISSION,
                         help="수수료율 (기본 0.00015 = 0.015%%)")
     parser.add_argument("--slippage", type=float, default=config.BACKTEST_SLIPPAGE,
