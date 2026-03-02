@@ -1,0 +1,40 @@
+# 환경변수 / 인증 정보 (절대 커밋 금지)
+.env
+*.env
+
+# API 토큰 캐시
+data/token.json
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 가상환경
+venv/
+env/
+.venv/
+
+# 로그
+logs/
+*.log
+
+# 스크리닝 결과 (런타임 데이터)
+data/screening_results.json
+backtest_results/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Jupyter
+.ipynb_checkpoints/
+
+# pytest
+.pytest_cache/
