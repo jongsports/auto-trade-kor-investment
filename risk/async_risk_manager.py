@@ -7,7 +7,7 @@ import threading
 
 import config
 from core.trader_api import AsyncKisAPI
-from utils.utils import is_trading_time
+from utils.utils import is_trading_time, get_trading_time_status
 
 logger = logging.getLogger("auto_trade.risk_manager")
 
@@ -111,8 +111,14 @@ class AsyncRiskManager:
             return fallback
 
     async def can_trade(self, ticker: str, order_type: str, quantity: int, price: float) -> tuple[bool, str]:
-        if not is_trading_time():
-            return False, "Not trading time."
+        # 매도는 동시호가(CLOSING_AUCTION, 15:20~15:30)도 허용
+        if order_type == "sell":
+            status = get_trading_time_status()
+            if status not in ("REGULAR", "CLOSING_AUCTION", "OPENING_AUCTION"):
+                return False, f"매도 불가 시간 (status={status})"
+        else:
+            if not is_trading_time():
+                return False, "Not trading time."
         if self.risk_status == "RISK" and order_type == "buy":
             return False, "Market is in extreme RISK."
 

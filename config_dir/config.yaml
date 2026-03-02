@@ -63,3 +63,5 @@ screening:
   min_volume_ratio: 2.5 # 최소 거래량 증가 비율
   min_amount_ratio: 3.0 # 최소 거래대금 증가 비율
   min_ma5_ratio: 0.03 # 5일 이동평균선 이격도 최소 비율
+  opening_gap_down_threshold: 0.03 # 시초가 갭하락 필터 임계값 (3% 이상 갭하락 제외)
+  opening_gap_up_threshold: 0.05   # 시초가 갭상승 추격방지 임계값 (5% 이상 갭상승 제외)

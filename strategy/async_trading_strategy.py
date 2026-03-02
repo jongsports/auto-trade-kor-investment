@@ -95,15 +95,19 @@ class AsyncTradingStrategy:
               return False, "Not held"
               
          holding_info = self.holdings[ticker]
-         current_price = await self.api_client.get_current_price(ticker)
+         price_data = await self.api_client.get_current_price(ticker)
+         current_price = price_data["price"] if price_data else 0
          status = get_trading_time_status()
          
-         if current_price is None or current_price == 0: 
+         if not current_price: 
               return False, "Invalid current price"
          
          holding_info["current_price"] = current_price
-         profit_ratio = current_price / holding_info["buy_price"] - 1
-         holding_info["high_price"] = max(holding_info["high_price"], current_price)
+         buy_price = holding_info.get("buy_price", 0)
+         if buy_price <= 0:
+              return False, "Invalid buy price"
+         profit_ratio = current_price / buy_price - 1
+         holding_info["high_price"] = max(holding_info.get("high_price", current_price), current_price)
          
          # Identify Strategy Type (assume 'reason' was stored during entry)
          # For backward compatibility, if 'reason' doesn't exist, we treat it as standard
@@ -132,29 +136,29 @@ class AsyncTradingStrategy:
 
          # Take Profit
          if profit_ratio >= take_profit_threshold:
-              return True, f"Take profit {profit_ratio:.2%}"
+              return True, f"목표 수익권 도달 ({profit_ratio:.2%})"
               
          # Dynamic Stop Loss from Risk Manager
          dynamic_sl = await self.risk_manager.calculate_dynamic_stoploss(ticker, holding_info["buy_price"])
          if current_price <= dynamic_sl:
-              return True, f"Dynamic Stop Loss Hit: {current_price} <= {dynamic_sl:.0f}"
+              return True, f"리스크 관리 손절 (하단 지지선 {dynamic_sl:.0f} 돌파)"
               
          # Fallback static stop loss
          if profit_ratio <= -self.stop_loss_ratio:
-              return True, f"Static Stop loss {profit_ratio:.2%}"
+              return True, f"최대 허용 손실 초과 ({profit_ratio:.2%})"
               
          # Trailing Stop
          trailing = 1 - (current_price / holding_info["high_price"])
          if trailing >= trailing_threshold and holding_info["high_price"] > holding_info["buy_price"] * 1.015:
-              return True, f"Trailing stop {trailing:.2%} from high {holding_info['high_price']}"
+              return True, f"고점 대비 하락 (트레일링 스탑 {trailing:.2%})"
               
          # Market conditions
          if status == "CLOSING_AUCTION":
-              return True, "Closing auction"
+              return True, "장 마감 전 동시호가 청산"
               
          holding_days = (datetime.now() - holding_info["entry_time"]).days
          if holding_days >= max_holding_days:
-              return True, f"Max holding days {holding_days}"
+              return True, f"최대 보유 기간 경과 ({holding_days}일)"
               
          return False, "Hold"
 
@@ -181,8 +185,9 @@ class AsyncTradingStrategy:
                 logger.warning(f"[매수거부] {ticker}: 가용 잔고 없음")
                 return None
             position_amount = await self.risk_manager.calculate_position_size(ticker, available)
-            current_price = await self.api_client.get_current_price(ticker)
-            if not current_price or current_price <= 0:
+            price_data = await self.api_client.get_current_price(ticker)
+            current_price = price_data["price"] if price_data else 0
+            if not current_price:
                 logger.warning(f"[매수거부] {ticker}: 현재가 조회 실패")
                 return None
             quantity = max(1, int(position_amount // current_price))
@@ -195,9 +200,14 @@ class AsyncTradingStrategy:
         result = await self.api_client.market_buy(ticker, quantity)
 
         if result.get("rt_cd") == "0":
-            current_price = await self.api_client.get_current_price(ticker)
+            price_data = await self.api_client.get_current_price(ticker)
+            current_price = price_data["price"] if price_data else price
+            # Find stock name from candidates if available
+            stock_name = next((c["name"] for c in self.candidate_stocks if c["ticker"] == ticker), ticker)
+            
             self.holdings[ticker] = {
                 "ticker": ticker,
+                "name": stock_name,
                 "quantity": quantity,
                 "buy_price": current_price or price,
                 "current_price": current_price or price,
@@ -237,7 +247,8 @@ class AsyncTradingStrategy:
         result = await self.api_client.market_sell(ticker, sell_qty)
 
         if result.get("rt_cd") == "0":
-            current_price = await self.api_client.get_current_price(ticker)
+            price_data = await self.api_client.get_current_price(ticker)
+            current_price = price_data["price"] if price_data else 0
             buy_price = self.holdings[ticker].get("buy_price", 0)
             profit_ratio = (current_price / buy_price - 1) if buy_price > 0 and current_price else 0
             self.order_history.append({

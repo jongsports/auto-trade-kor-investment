@@ -71,6 +71,9 @@ MIN_GAP_UP = float(screen_config.get("min_gap_up", 0.02))
 MIN_VOLUME_RATIO = float(screen_config.get("min_volume_ratio", 2.5))
 MIN_AMOUNT_RATIO = float(screen_config.get("min_amount_ratio", 3.0))
 MIN_MA5_RATIO = float(screen_config.get("min_ma5_ratio", 0.03))
+# 시초가 갭 필터 (다단계 동적 스크리닝 #8)
+OPENING_GAP_DOWN_THRESHOLD = float(screen_config.get("opening_gap_down_threshold", 0.03))
+OPENING_GAP_UP_THRESHOLD   = float(screen_config.get("opening_gap_up_threshold",   0.05))
 
 # Notifications 카테고리 (yaml에서 활성화 여부 등만 가져오고, 토큰은 env우선순위 사용)
 NOTI_CONFIG = config.get("notifications", {})
@@ -132,6 +135,11 @@ ADDITIONAL_ENTRY_END = "09:10"
 MARKET_CLOSE = "15:30"
 LUNCH_START_TIME = "11:20"
 LUNCH_END_TIME = "13:00"
+
+# Dynamic Screening Settings
+DYNAMIC_SCREENING_TIMES = ["09:05", "10:30", "13:30", "14:40"]
+MIN_INTRADAY_VOLUME_RATIO = 0.5 # 50% of avg daily volume reached
+INTRADAY_MOMENTUM_WEIGHT = 1.5  # Boost score if price > open and volume surging
 
 BACKTEST_MODE = os.getenv("BACKTEST_MODE", "False").lower() == "true"
 

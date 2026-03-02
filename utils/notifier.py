@@ -1,6 +1,9 @@
 import logging
 import aiohttp
 import config
+import asyncio
+import ssl
+import certifi
 
 logger = logging.getLogger("auto_trade.notifier")
 
@@ -12,13 +15,21 @@ class AsyncTelegramNotifier:
         self.chat_id = config.TELEGRAM_CHAT_ID
         self.api_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         
+        # SSL Context 설정 (macOS 등에서 인증서 라이브러리 문제 해결)
+        try:
+            self.ssl_context = ssl.create_default_context(cafile=certifi.where())
+        except Exception as e:
+            logger.warning(f"SSL 컨텍스트 생성 중 경고: {e}. 기본 설정 사용 시도.")
+            self.ssl_context = None
+        
     async def send_message(self, message: str):
         if not self.enabled or not self.token or not self.chat_id:
             logger.debug("텔레그램 알림이 비활성화되어 있거나 토큰/채널ID가 없습니다.")
             return False
             
         try:
-            async with aiohttp.ClientSession() as session:
+            connector = aiohttp.TCPConnector(ssl=self.ssl_context)
+            async with aiohttp.ClientSession(connector=connector) as session:
                 payload = {
                     "chat_id": self.chat_id,
                     "text": message,
