@@ -25,8 +25,9 @@ class AsyncRiskManager:
 
     async def assess_market_risk(self):
         try:
-            # U001 = KOSPI 지수. ma60 계산을 위해 최소 100행 필요
-            kospi_data = await self.api_client.get_ohlcv("U001", "D", 100)
+            # KOSPI 지수 대용: KODEX 200 ETF (069500) — 모의투자 포함 전 환경에서 데이터 제공
+            # KIS API는 지수 자체 OHLCV에 별도 TR(FHKUP03500100)이 필요하므로 ETF로 대체
+            kospi_data = await self.api_client.get_ohlcv("069500", "D", 100)
             if kospi_data.empty:
                 logger.warning("KOSPI data empty, skipping risk assessment.")
                 return
