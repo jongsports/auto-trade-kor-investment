@@ -34,11 +34,11 @@ class AsyncStockScreener:
     # ------------------------------------------------------------------
 
     async def get_market_stocks(self, market="KOSPI") -> List[str]:
-        """거래량/거래대금 상위 종목 조회 (Dynamic)."""
+        """거래량/거래대금 상위 종목 조회 (Dynamic). Issue #10-D: KOSPI 50, KOSDAQ 30으로 확대."""
         if market == "KOSPI":
-            return await self.api_client.get_top_market_stocks("0001", count=30)
+            return await self.api_client.get_top_market_stocks("0001", count=50)
         elif market == "KOSDAQ":
-            return await self.api_client.get_top_market_stocks("1001", count=20)
+            return await self.api_client.get_top_market_stocks("1001", count=30)
         return []
 
     # ------------------------------------------------------------------
@@ -60,7 +60,7 @@ class AsyncStockScreener:
             if not ticker:
                 continue
             try:
-                ohlcv = await self.api_client.get_ohlcv(ticker, period="D", count=2)
+                ohlcv = await self.api_client.get_ohlcv(ticker, count=2)  # Issue #9-A: period_code 기본값 "D" 사용
                 if ohlcv.empty or len(ohlcv) < 2:
                     validated.append(c)
                     continue
@@ -539,12 +539,19 @@ class AsyncStockScreener:
     # 단일 종목 처리 (핵심 파이프라인)
     # ------------------------------------------------------------------
 
-    async def _process_ticker(self, ticker: str, market: str, 
+    async def _process_ticker(self, ticker: str, market: str,
                              is_overnight_window: bool = False,
                              is_intraday: bool = False) -> dict:
-        """단일 종목 비동기 처리: OHLCV → 종목명 → 수급 → 뉴스 → 점수 → 반환."""
+        """단일 종목 비동기 처리: OHLCV → 수급 → 뉴스 → 점수 → 반환.
+
+        Issue #10-A: 비인트라데이 모드에서 get_current_price() API 호출 제거 (API 절약).
+                     현재가는 OHLCV 마지막 종가를 사용.
+        Issue #10-B: 뉴스 분석 5초 타임아웃으로 파이프라인 블로킹 방지.
+        Issue #9-C:  market_code 파라미터를 get_investor_trend()에 전달 (KOSDAQ 버그 수정).
+        Issue #9-D:  reason 태그를 "Overnight"/"Intraday"/"Momentum" 으로 통일.
+        """
         try:
-            # 1. OHLCV 조회
+            # 1. OHLCV 조회 (캐시 활용 Issue #10-E)
             ohlcv_data = await self.api_client.get_ohlcv(ticker, period_code="D", count=100)
 
             if ohlcv_data.empty:
@@ -555,30 +562,36 @@ class AsyncStockScreener:
                 logger.warning(f"[{ticker}] 데이터 부족 ({len(ohlcv_data)}행) - 건너뜀")
                 return {}
 
-            # 2. 현재가 및 종목 세부 정보 (인트라데이 분석용)
-            price_data = await self.api_client.get_current_price(ticker)
-            if not price_data:
-                logger.warning(f"[{ticker}] 실시간 가격 조회 실패 - 건너뜀")
-                return {}
-                
-            current_price = price_data.get("price", 0)
-            # In a real system, the name might be in price_data or ohlcv or a cache
-            # For now, we try to use ticker if not explicitly available
-            stock_name = ticker 
+            # 2. 현재가 — 인트라데이 모드만 실시간 조회, 나머지는 OHLCV 종가 사용 (Issue #10-A)
+            current_price = float(ohlcv_data["close"].iloc[-1])
+            intraday_data = None
 
-            # 3. 수급 조회
-            investor_trend = await self.api_client.get_investor_trend(ticker)
+            if is_intraday:
+                price_data = await self.api_client.get_current_price(ticker)
+                if price_data:
+                    current_price = price_data.get("price", current_price)
+                    intraday_data = price_data
+                else:
+                    logger.debug(f"[{ticker}] 실시간 가격 조회 실패 - OHLCV 종가 사용")
 
-            # 4. 뉴스 점수
+            stock_name = ticker
+
+            # 3. 수급 조회 — KOSDAQ 시 market_code="K" 전달 (Issue #9-C)
+            market_code = self.market_codes.get(market, "J")
+            investor_trend = await self.api_client.get_investor_trend(ticker, market_code=market_code)
+
+            # 4. 뉴스 점수 — 5초 타임아웃으로 파이프라인 블로킹 방지 (Issue #10-B)
             news_score_raw = 0.0
             if self.news_analyzer is not None:
                 try:
-                    # 인트라데이 분석 시에는 더 좁은 시간 범위의 뉴스 중요
                     news_days = 1 if is_intraday else 2
-                    news_result = await self.news_analyzer.analyze_stock_news(
-                        ticker, stock_name, days=news_days
+                    news_result = await asyncio.wait_for(
+                        self.news_analyzer.analyze_stock_news(ticker, stock_name, days=news_days),
+                        timeout=5.0
                     )
                     news_score_raw = float(news_result.get("score", 0.0))
+                except asyncio.TimeoutError:
+                    logger.debug(f"[{ticker}] 뉴스 분석 타임아웃 (5s) - 점수 0 처리")
                 except Exception as e:
                     logger.debug(f"[{ticker}] 뉴스 분석 실패: {e}")
 
@@ -589,7 +602,7 @@ class AsyncStockScreener:
                 investor_trend=investor_trend,
                 is_overnight_window=is_overnight_window,
                 is_intraday=is_intraday,
-                intraday_data=price_data,
+                intraday_data=intraday_data,
                 news_score=news_score_raw,
             )
             total_score = score_dict["total"]
@@ -599,18 +612,23 @@ class AsyncStockScreener:
             if total_score < threshold:
                 return {}
 
-            detailed_reason = self._generate_confluence_reason(score_dict)
+            # 7. reason 태그 통일 — async_trader 필터링과 전략 청산 로직에서 정확히 매칭 (Issue #9-D)
             if is_overnight_window:
-                detailed_reason = f"오버나이트: {detailed_reason}"
+                reason_tag = "Overnight"
             elif is_intraday:
-                detailed_reason = f"실시간 모멘텀: {detailed_reason}"
+                reason_tag = "Intraday"
+            else:
+                reason_tag = "Momentum"
+
+            detail = self._generate_confluence_reason(score_dict)
+            logger.debug(f"[{ticker}] reason={reason_tag} score={total_score} detail={detail}")
 
             return {
                 "ticker":  ticker,
                 "name":    stock_name,
                 "score":   total_score,
                 "price":   current_price,
-                "reason":  detailed_reason,
+                "reason":  reason_tag,
                 "market":  market,
                 "source":  "confluence",
                 "score_breakdown":     score_dict,

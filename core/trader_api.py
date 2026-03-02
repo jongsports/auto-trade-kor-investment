@@ -36,7 +36,11 @@ class AsyncKisAPI:
         
         # Rate Limiter Semaphore (Limit to TPS based on KIS API limits)
         # VTS(Demo) is extremely strict, only 1 concurrent request and 1-2 calls per sec total.
-        self.semaphore = asyncio.Semaphore(1 if self.demo_mode else 10) 
+        self.semaphore = asyncio.Semaphore(1 if self.demo_mode else 10)
+
+        # TTL 캐시 (Issue #10-E/F)
+        self._ohlcv_cache: Dict[str, Any] = {}   # key: f"{ticker}_{period_code}_{count}", value: (df, timestamp)
+        self._trend_cache: Dict[str, Any] = {}    # key: f"{ticker}_{market_code}", value: (result, timestamp)
 
     async def init_session(self):
         """Initialize aiohttp session."""
@@ -169,12 +173,19 @@ class AsyncKisAPI:
 
     async def get_ohlcv(self, ticker: str, period_code: str = "D", count: int = 100) -> pd.DataFrame:
         """Fetch historical price data asynchronously."""
-        # Note: In real life, KIS API requires specifying start/end dates for historical data.
-        # This uses the current basic auto-trade implementation translated to async.
-        
-        # Calculate dates
+        # TTL 캐시 조회 (Issue #10-E): 장중 5분, 장외 1시간
+        cache_key = f"{ticker}_{period_code}_{count}"
+        if cache_key in self._ohlcv_cache:
+            cached_df, cached_time = self._ohlcv_cache[cache_key]
+            now = datetime.now()
+            market_hours = (9 <= now.hour < 15) or (now.hour == 15 and now.minute <= 30)
+            ttl = 300 if market_hours else 3600
+            if (now - cached_time).total_seconds() < ttl:
+                return cached_df
+
+        # Calculate dates — 2년치 동적 범위 (Issue #10-C)
         end_date = datetime.now()
-        start_date_str = "20240101" # Fixed far-past start date to ensure data on VTS
+        start_date_str = (end_date - timedelta(days=730)).strftime("%Y%m%d")
         end_date_str = end_date.strftime("%Y%m%d")
         
         params = {
@@ -231,6 +242,7 @@ class AsyncKisAPI:
                     
             df["date"] = pd.to_datetime(df["date"], format="%Y%m%d", errors="coerce")
             df = df.sort_values("date").tail(count).reset_index(drop=True)
+            self._ohlcv_cache[cache_key] = (df, datetime.now())
             return df
         else:
             logger.error(f"OHLCV Request Failed for {ticker}: {res}")
@@ -327,8 +339,8 @@ class AsyncKisAPI:
         logger.info(f"[{ticker}] get_ohlcv_by_range: {len(result)}행 수집 ({start_date}~{end_date})")
         return result
 
-    async def get_current_price(self, ticker: str) -> Optional[int]:
-        """Get the current price asynchronously."""
+    async def get_current_price(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """Get the current price and basic intraday data asynchronously."""
         params = {
             "FID_COND_MRKT_DIV_CODE": "J",
             "FID_INPUT_ISCD": ticker,
@@ -337,7 +349,15 @@ class AsyncKisAPI:
         res = await self._fetch("GET", "/uapi/domestic-stock/v1/quotations/inquire-price", "FHKST01010100", params=params)
         
         if res.get("rt_cd") == "0" and "output" in res:
-            return int(res["output"]["stck_prpr"])
+            out = res["output"]
+            return {
+                "price": int(out["stck_prpr"]),
+                "open":  int(out["stck_oprc"]),
+                "high":  int(out["stck_hgpr"]),
+                "low":   int(out["stck_lwpr"]),
+                "volume": int(out["acml_vol"]),
+                "amount": int(out["acml_tr_pbmn"]),
+            }
         return None
         
     async def get_account_summary(self) -> Dict[str, Any]:
@@ -446,16 +466,27 @@ class AsyncKisAPI:
             logger.error(f"[매도실패] {ticker} {quantity}주 | {res.get('msg1', '')}")
         return res
         
-    async def get_investor_trend(self, ticker: str) -> Dict[str, Any]:
+    async def get_investor_trend(self, ticker: str, market_code: str = "J") -> Dict[str, Any]:
         """
         종목별 외국인/기관 수급 조회.
         Primary  : HHPTJ04160200 (investor-trend-estimate) - 장중 추정가집계 (4회 갱신)
         Fallback : FHKST01010900 (inquire-investor)        - 당일 확정치 (장종료 후 제공)
 
+        Args:
+            ticker: 종목코드
+            market_code: 시장구분코드 "J"(KOSPI) / "K"(KOSDAQ) — Fallback 엔드포인트에 사용
+
         Returns:
             dict: foreign_net_buy (외국인 순매수), institution_net_buy (기관 순매수),
                   prgrm_net_buy (프로그램 순매수) — 모두 순매수 수량(주), 양수=순매수
         """
+        # TTL 캐시 조회 (30분)
+        cache_key = f"{ticker}_{market_code}"
+        if cache_key in self._trend_cache:
+            cached_result, cached_time = self._trend_cache[cache_key]
+            if (datetime.now() - cached_time).total_seconds() < 1800:
+                return cached_result
+
         # --- Primary: 장중 추정가집계 (09:30/11:20/13:20/14:30 갱신) ---
         try:
             res = await self._fetch(
@@ -469,7 +500,9 @@ class AsyncKisAPI:
                 orgn = sum(int(r.get("orgn_fake_ntby_qty", 0) or 0) for r in res["output2"])
                 if frgn != 0 or orgn != 0:
                     logger.debug(f"[수급-추정] {ticker} | 외국인:{frgn:+,} 기관:{orgn:+,}")
-                    return {"foreign_net_buy": frgn, "institution_net_buy": orgn, "prgrm_net_buy": 0}
+                    result = {"foreign_net_buy": frgn, "institution_net_buy": orgn, "prgrm_net_buy": 0}
+                    self._trend_cache[cache_key] = (result, datetime.now())
+                    return result
         except Exception as e:
             logger.warning(f"investor-trend-estimate 실패 {ticker}: {e}")
 
@@ -479,15 +512,17 @@ class AsyncKisAPI:
                 "GET",
                 "/uapi/domestic-stock/v1/quotations/inquire-investor",
                 "FHKST01010900",
-                params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker}
+                params={"FID_COND_MRKT_DIV_CODE": market_code, "FID_INPUT_ISCD": ticker}
             )
             if res.get("rt_cd") == "0" and res.get("output"):
                 output = res["output"]
                 row = output[0] if isinstance(output, list) and len(output) > 0 else output
                 frgn = int(row.get("frgn_ntby_qty", 0) or 0)
                 orgn = int(row.get("orgn_ntby_qty", 0) or 0)
-                logger.debug(f"[수급-확정] {ticker} | 외국인:{frgn:+,} 기관:{orgn:+,}")
-                return {"foreign_net_buy": frgn, "institution_net_buy": orgn, "prgrm_net_buy": 0}
+                logger.debug(f"[수급-확정] {ticker}({market_code}) | 외국인:{frgn:+,} 기관:{orgn:+,}")
+                result = {"foreign_net_buy": frgn, "institution_net_buy": orgn, "prgrm_net_buy": 0}
+                self._trend_cache[cache_key] = (result, datetime.now())
+                return result
         except Exception as e:
             logger.warning(f"inquire-investor 폴백 실패 {ticker}: {e}")
 

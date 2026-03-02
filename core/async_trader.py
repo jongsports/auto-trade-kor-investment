@@ -227,7 +227,7 @@ class AsyncAutoTrader:
         당일 실시간 데이터를 포함해 실제 모멘텀을 반영한다.
         """
         logger.info("장중 모멘텀 스크리닝 시작")
-        new_candidates = await self.screener.run_screening_async(["KOSPI", "KOSDAQ"])
+        new_candidates = await self.screener.run_screening_async(["KOSPI", "KOSDAQ"], is_intraday=True)  # Issue #9-B
 
         # 기존 후보에 신규 합산 (중복 제거, 점수 내림차순)
         existing_tickers = {c["ticker"] for c in self.candidate_stocks}

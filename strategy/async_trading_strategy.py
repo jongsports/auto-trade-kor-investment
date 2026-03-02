@@ -125,14 +125,13 @@ class AsyncTradingStrategy:
                    
               return False, "Hold Overnight"
               
-         # --- 2. MOMENTUM / DAY TRADE LOGIC ---
-         # 스크리너는 "Overnight" 또는 "Momentum"을 반환; "Standard"는 반환하지 않음
-         # "Momentum": 짧은 trailing stop, 짧은 보유 기간
-         # 그 외(Momentum 포함): config 기본값 사용
-         is_momentum = (strategy_type == "Momentum")
-         trailing_threshold = 0.02 if is_momentum else self.trailing_stop
-         take_profit_threshold = 0.03 if is_momentum else self.take_profit_ratio
-         max_holding_days = 1 if is_momentum else 5
+         # --- 2. MOMENTUM / INTRADAY / DAY TRADE LOGIC ---
+         # 스크리너는 "Overnight" / "Intraday" / "Momentum" 태그 반환 (Issue #9-D)
+         # "Momentum"/"Intraday": 짧은 trailing stop, 당일 청산
+         is_short_term = strategy_type in ("Momentum", "Intraday")
+         trailing_threshold = 0.02 if is_short_term else self.trailing_stop
+         take_profit_threshold = 0.03 if is_short_term else self.take_profit_ratio
+         max_holding_days = 1 if is_short_term else 5
 
          # Take Profit
          if profit_ratio >= take_profit_threshold:
