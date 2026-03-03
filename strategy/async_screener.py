@@ -398,7 +398,7 @@ class AsyncStockScreener:
         technical_score  = 0   # max 40
         volume_score     = 0   # max 20
         order_flow_score = 0   # max 30
-        news_pts         = max(0, min(10, int(news_score)))
+        news_pts         = max(-5, min(10, int(news_score)))   # S1: 부정 뉴스 패널티
         overnight_bonus  = 0
         intraday_bonus   = 0
 
@@ -487,8 +487,12 @@ class AsyncStockScreener:
                         if close_position >= 0.8 and self.check_volume_surge(df):
                             overnight_bonus = 20
 
-                        # 오버나이트 필수 조건: 외국인 또는 기관 순매수 반드시 있어야 함
-                        if order_flow_score == 0:
+                        # 오버나이트 필수 조건: 외국인 또는 기관 순매수
+                        # Issue #13: API 실패(data_available=False)는 확정 0과 구분
+                        # - 데이터 미수신: 오버나이트 허용 (보너스만 제외)
+                        # - 확정 순매도(both 0 + data_available=True): 실격
+                        trend_data_ok = investor_trend.get("data_available", True)
+                        if order_flow_score == 0 and trend_data_ok:
                             technical_score = 0
                             volume_score    = 0
                             overnight_bonus = 0
@@ -551,21 +555,23 @@ class AsyncStockScreener:
         Issue #9-D:  reason 태그를 "Overnight"/"Intraday"/"Momentum" 으로 통일.
         """
         try:
-            # 1. OHLCV 조회 (캐시 활용 Issue #10-E)
-            ohlcv_data = await self.api_client.get_ohlcv(ticker, period_code="D", count=100)
+            # 1+3. OHLCV & 수급 병렬 조회 — 독립적이므로 gather (P7)
+            market_code = self.market_codes.get(market, "J")
+            ohlcv_data, investor_trend = await asyncio.gather(
+                self.api_client.get_ohlcv(ticker, period_code="D", count=100),
+                self.api_client.get_investor_trend(ticker, market_code=market_code),
+            )
 
             if ohlcv_data.empty:
                 logger.warning(f"[{ticker}] OHLCV 데이터 없음 - 건너뜀")
                 return {}
-
             if len(ohlcv_data) < 20:
                 logger.warning(f"[{ticker}] 데이터 부족 ({len(ohlcv_data)}행) - 건너뜀")
                 return {}
 
-            # 2. 현재가 — 인트라데이 모드만 실시간 조회, 나머지는 OHLCV 종가 사용 (Issue #10-A)
+            # 2. 현재가 — 인트라데이 모드만 실시간 조회 (Issue #10-A)
             current_price = float(ohlcv_data["close"].iloc[-1])
             intraday_data = None
-
             if is_intraday:
                 price_data = await self.api_client.get_current_price(ticker)
                 if price_data:
@@ -575,10 +581,6 @@ class AsyncStockScreener:
                     logger.debug(f"[{ticker}] 실시간 가격 조회 실패 - OHLCV 종가 사용")
 
             stock_name = ticker
-
-            # 3. 수급 조회 — KOSDAQ 시 market_code="K" 전달 (Issue #9-C)
-            market_code = self.market_codes.get(market, "J")
-            investor_trend = await self.api_client.get_investor_trend(ticker, market_code=market_code)
 
             # 4. 뉴스 점수 — 5초 타임아웃으로 파이프라인 블로킹 방지 (Issue #10-B)
             news_score_raw = 0.0
@@ -634,6 +636,7 @@ class AsyncStockScreener:
                 "score_breakdown":     score_dict,
                 "foreign_net_buy":     investor_trend.get("foreign_net_buy", 0),
                 "institution_net_buy": investor_trend.get("institution_net_buy", 0),
+                "_ohlcv_snapshot":     ohlcv_data,   # 매수 단계 재조회 방지 (P4)
             }
 
         except Exception as e:

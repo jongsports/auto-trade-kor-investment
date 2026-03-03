@@ -4,6 +4,7 @@ import logging
 import asyncio
 import aiohttp
 import time
+import random
 from datetime import datetime, timedelta
 from urllib.parse import urljoin
 import pandas as pd
@@ -42,12 +43,21 @@ class AsyncKisAPI:
         self._ohlcv_cache: Dict[str, Any] = {}   # key: f"{ticker}_{period_code}_{count}", value: (df, timestamp)
         self._trend_cache: Dict[str, Any] = {}    # key: f"{ticker}_{market_code}", value: (result, timestamp)
 
+        # 서킷브레이커 (R1)
+        self._cb_failure_count: int = 0
+        self._cb_open_until = None
+        self._cb_threshold: int = 5
+        self._cb_open_seconds: int = 60
+
     async def init_session(self):
         """Initialize aiohttp session."""
         if self.session is None or self.session.closed:
+            timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
+            connector = aiohttp.TCPConnector(ssl=False, limit=20, limit_per_host=10, ttl_dns_cache=300)
             self.session = aiohttp.ClientSession(
                 headers={"Content-Type": "application/json"},
-                connector=aiohttp.TCPConnector(ssl=False)
+                connector=connector,
+                timeout=timeout,
             )
             
     async def close(self):
@@ -123,53 +133,83 @@ class AsyncKisAPI:
         }
 
     async def _fetch(self, method: str, path: str, tr_id: str, **kwargs) -> dict:
-        """Helper to make an async API request with rate limiting and retries."""
+        """Helper to make an async API request with rate limiting and retries.
+
+        Issue #11: demo 모드 1.1s 쿨다운을 finally 블록으로 이동하여
+        성공/HTTP에러/네트워크예외 모든 경로에서 쿨다운 보장.
+        세마포어를 반환하기 전에 항상 sleep → TPS 버스트 원천 차단.
+        """
         if not self.is_connected:
-             self.connect()
-             
+            self.connect()
+
         await self.init_session()
+
+        # 서킷브레이커 차단 확인 (R1)
+        if self._cb_open_until and datetime.now() < self._cb_open_until:
+            remaining = int((self._cb_open_until - datetime.now()).total_seconds())
+            logger.warning(f"[서킷브레이커] 차단 중 ({remaining}초 남음) tr_id={tr_id}")
+            return {"rt_cd": "-1", "msg1": "Circuit breaker open"}
+
         url = urljoin(self.base_url, path)
-        
         max_retries = 5
+
         async with self.semaphore:
-            for attempt in range(max_retries):
-                headers = self.get_headers(tr_id)
-                async with self.session.request(method, url, headers=headers, **kwargs) as response:
-                    # KIS sometimes returns JSON error bodies even on 500
-                    if response.status == 500:
-                        try:
-                            res_data = await response.json()
-                        except:
-                            text = await response.text()
-                            logger.error(f"API HTTP 500 Error: {text}")
-                            return {"rt_cd": "-1", "msg1": "HTTP 500"}
-                    elif response.status != 200:
-                        text = await response.text()
-                        logger.error(f"API Request Error: {response.status} - {text}")
-                        return {"rt_cd": "-1", "msg1": "HTTP Error"}
-                    else:
-                        res_data = await response.json()
-                    
-                    # 1. TPS Limit Error (EGW00201)
-                    if res_data.get("msg_cd") == "EGW00201":
-                        wait_time = 2.0 * (attempt + 1)
-                        logger.warning(f"TPS Limit exceeded. Waiting {wait_time}s... (Attempt {attempt+1}/{max_retries})")
-                        await asyncio.sleep(wait_time)
-                        continue  # Retry loop
-                        
-                    # 2. Token Expired (EGW00123 / EGW00121)
-                    if res_data.get("msg_cd") in ["EGW00123", "EGW00121"]:
-                         logger.warning("Token expired during API call. Refreshing token.")
-                         self._sync_init()
-                         continue
-                    
-                    # Mandatory cool-off for Demo server to prevent back-to-back TPS errors
-                    if self.demo_mode:
-                        await asyncio.sleep(1.1)
-                        
-                    return res_data
-                    
-        return {"rt_cd": "-1", "msg1": "Max retries exceeded"}
+            try:
+                for attempt in range(max_retries):
+                    try:
+                        headers = self.get_headers(tr_id)
+                        async with self.session.request(method, url, headers=headers, **kwargs) as response:
+                            # KIS sometimes returns JSON error bodies even on 500
+                            if response.status == 500:
+                                try:
+                                    res_data = await response.json()
+                                except Exception:
+                                    text = await response.text()
+                                    logger.error(f"API HTTP 500 Error: {text}")
+                                    return {"rt_cd": "-1", "msg1": "HTTP 500"}
+                            elif response.status != 200:
+                                text = await response.text()
+                                logger.error(f"API Request Error: {response.status} - {text}")
+                                return {"rt_cd": "-1", "msg1": "HTTP Error"}
+                            else:
+                                res_data = await response.json()
+
+                            # 1. TPS Limit Error (EGW00201)
+                            if res_data.get("msg_cd") == "EGW00201":
+                                jitter = random.uniform(0.0, 1.0)
+                                wait_time = 2.0 * (attempt + 1) + jitter
+                                logger.warning(f"TPS 한도 초과. {wait_time:.2f}초 대기 (시도 {attempt+1}/{max_retries})")
+                                await asyncio.sleep(wait_time)
+                                continue
+
+                            # 2. Token Expired (EGW00123 / EGW00121)
+                            if res_data.get("msg_cd") in ["EGW00123", "EGW00121"]:
+                                logger.warning("토큰 만료 감지 — 비동기 갱신 중...")
+                                await asyncio.to_thread(self._sync_init)
+                                continue
+
+                            self._cb_failure_count = 0
+                            self._cb_open_until = None
+                            return res_data
+
+                    except Exception as e:
+                        logger.error(f"Request exception (attempt {attempt+1}/{max_retries}) tr_id={tr_id}: {e}")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(1.0)
+
+                # 최대 재시도 초과
+                self._cb_failure_count += 1
+                if self._cb_failure_count >= self._cb_threshold:
+                    self._cb_open_until = datetime.now() + timedelta(seconds=self._cb_open_seconds)
+                    logger.error(f"[서킷브레이커] 연속 {self._cb_failure_count}회 실패 → {self._cb_open_seconds}초 차단")
+                    self._cb_failure_count = 0
+                return {"rt_cd": "-1", "msg1": "Max retries exceeded"}
+
+            finally:
+                # Issue #11: 성공/에러/예외 모든 경로에서 demo 쿨다운 보장
+                # 세마포어 반환 직전 실행 → 다음 _fetch() 호출과 최소 1.1s 간격 확보
+                if self.demo_mode:
+                    await asyncio.sleep(1.1)
 
     async def get_ohlcv(self, ticker: str, period_code: str = "D", count: int = 100) -> pd.DataFrame:
         """Fetch historical price data asynchronously."""
@@ -178,8 +218,18 @@ class AsyncKisAPI:
         if cache_key in self._ohlcv_cache:
             cached_df, cached_time = self._ohlcv_cache[cache_key]
             now = datetime.now()
-            market_hours = (9 <= now.hour < 15) or (now.hour == 15 and now.minute <= 30)
-            ttl = 300 if market_hours else 3600
+            now_hm = now.hour * 60 + now.minute
+            screening_windows = (
+                (8 * 60 + 55 <= now_hm <= 10 * 60 + 40) or
+                (13 * 60 + 25 <= now_hm <= 13 * 60 + 40)
+            )
+            market_open = (9 * 60 <= now_hm <= 15 * 60 + 30)
+            if screening_windows:
+                ttl = 120
+            elif market_open:
+                ttl = 300
+            else:
+                ttl = 1800
             if (now - cached_time).total_seconds() < ttl:
                 return cached_df
 
@@ -484,7 +534,10 @@ class AsyncKisAPI:
         cache_key = f"{ticker}_{market_code}"
         if cache_key in self._trend_cache:
             cached_result, cached_time = self._trend_cache[cache_key]
-            if (datetime.now() - cached_time).total_seconds() < 1800:
+            _now = datetime.now()
+            _hm = _now.hour * 60 + _now.minute
+            trend_ttl = 600 if (9 * 60 <= _hm <= 15 * 60 + 30) else 1800
+            if (_now - cached_time).total_seconds() < trend_ttl:
                 return cached_result
 
         # --- Primary: 장중 추정가집계 (09:30/11:20/13:20/14:30 갱신) ---
@@ -526,8 +579,10 @@ class AsyncKisAPI:
         except Exception as e:
             logger.warning(f"inquire-investor 폴백 실패 {ticker}: {e}")
 
-        logger.warning(f"get_investor_trend: 모든 방법 실패 {ticker} → 0 반환")
-        return {"foreign_net_buy": 0, "institution_net_buy": 0, "prgrm_net_buy": 0}
+        logger.warning(f"get_investor_trend: 모든 방법 실패 {ticker} → 중립 반환")
+        # Issue #13: data_available=False 로 실패를 확정 0과 구분
+        # 스크리너에서 이 값을 확인해 오버나이트 자동 실격 방지
+        return {"foreign_net_buy": 0, "institution_net_buy": 0, "prgrm_net_buy": 0, "data_available": False}
 
     async def get_top_market_stocks(self, market_code="0001", count=200) -> List[str]:
         """

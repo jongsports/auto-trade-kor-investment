@@ -60,9 +60,21 @@ class AsyncAutoTrader:
         # 2. 재시작 시 당일 스크리닝 결과 복원 (issue #7-C)
         await self._load_screening_results()
 
+        async def _run_with_restart(coro_fn, name: str):
+            while self.running:
+                try:
+                    await coro_fn()
+                except asyncio.CancelledError:
+                    logger.info(f"[{name}] 취소됨")
+                    break
+                except Exception as e:
+                    logger.error(f"[{name}] 예외 발생, 5초 후 재시작: {e}", exc_info=True)
+                    await self.notifier.send_message(f"⚠️ <b>[{name}] 태스크 재시작</b>\n오류: {e}")
+                    await asyncio.sleep(5)
+
         self.tasks = [
-            asyncio.create_task(self._scheduled_morning_routine()),
-            asyncio.create_task(self._monitor_loop()),
+            asyncio.create_task(_run_with_restart(self._scheduled_morning_routine, "morning_routine")),
+            asyncio.create_task(_run_with_restart(self._monitor_loop, "monitor_loop")),
         ]
         await asyncio.gather(*self.tasks)
 
@@ -124,6 +136,24 @@ class AsyncAutoTrader:
                 logger.info("08:00 사전 스크리닝 시작...")
                 await self._premarket_screening()
 
+            # 08:30 — 사전 스크리닝 재시도 (Issue #14: 08:00 TPS 실패 대비)
+            elif now_str == "08:30" and self._should_trigger("08:30"):
+                self._mark_triggered("08:30")
+                if not self.candidate_stocks:
+                    logger.info("08:30 사전 스크리닝 재시도 (08:00 결과 없음)...")
+                    await self._premarket_screening()
+                else:
+                    logger.info(f"08:30 재시도 불필요 — 기존 후보 {len(self.candidate_stocks)}종목 유지")
+
+            # 08:50 — 사전 스크리닝 최종 재시도 (Issue #14)
+            elif now_str == "08:50" and self._should_trigger("08:50"):
+                self._mark_triggered("08:50")
+                if not self.candidate_stocks:
+                    logger.info("08:50 사전 스크리닝 최종 재시도...")
+                    await self._premarket_screening()
+                else:
+                    logger.info(f"08:50 재시도 불필요 — 기존 후보 {len(self.candidate_stocks)}종목 유지")
+
             # 09:05 — 시초가 갭 검증 + 첫 매수
             elif now_str == "09:05" and self._should_trigger("09:05"):
                 self._mark_triggered("09:05")
@@ -135,6 +165,13 @@ class AsyncAutoTrader:
                 self._mark_triggered(now_str)
                 logger.info(f"{now_str} 장중 모멘텀 스크리닝 시작...")
                 await self._intraday_screening_and_entry()
+
+            # 11:20, 13:00 — 시장 리스크 재평가 (R2)
+            elif now_str in ("11:20", "13:00") and self._should_trigger(f"market_risk_{now_str}"):
+                self._mark_triggered(f"market_risk_{now_str}")
+                logger.info(f"{now_str} 시장 리스크 재평가...")
+                await self.risk_manager.assess_market_risk()
+                logger.info(f"리스크 갱신: {self.risk_manager.risk_status} / {self.risk_manager.market_condition}")
 
             # 15:10 — 오버나이트 진입 (issue #6-A)
             elif now_str == "15:10" and self._should_trigger("15:10"):
@@ -168,17 +205,21 @@ class AsyncAutoTrader:
                     logger.info("Background news monitoring...")
                     try:
                         if self.candidate_stocks and self.screener.news_analyzer:
-                            urgent = []
-                            for c in self.candidate_stocks[:10]:
-                                ticker = c.get("ticker", "")
-                                name = c.get("name", ticker)
-                                if not ticker:
-                                    continue
-                                news_res = await self.screener.news_analyzer.analyze_stock_news(
-                                    ticker, name, days=0.04
-                                )
-                                if news_res.get("score", 0) >= 8:
-                                    urgent.append({"ticker": ticker, "news_score": news_res["score"]})
+                            watch_list = [
+                                (c.get("ticker",""), c.get("name", c.get("ticker","")))
+                                for c in self.candidate_stocks[:10] if c.get("ticker")
+                            ]
+                            async def fetch_news(t, n):
+                                try:
+                                    return t, await asyncio.wait_for(
+                                        self.screener.news_analyzer.analyze_stock_news(t, n, days=0.04),
+                                        timeout=5.0
+                                    )
+                                except Exception:
+                                    return t, {"score": 0}
+                            news_results = await asyncio.gather(*[fetch_news(t, n) for t, n in watch_list])
+                            urgent = [{"ticker": t, "news_score": r.get("score",0)}
+                                      for t, r in news_results if r.get("score",0) >= 8]
                             if urgent:
                                 logger.warning(f"긴급 뉴스 발견: {len(urgent)}건 {urgent}")
                     except Exception as e:
@@ -274,26 +315,40 @@ class AsyncAutoTrader:
     # ------------------------------------------------------------------ #
 
     async def _execute_entries(self, candidates: list):
-        """후보 종목 매수 실행 공통 로직."""
-        for c in candidates:
+        """후보 종목 매수 — 조건 체크 병렬, 주문 순차 (중복·리스크 체크 정합성)."""
+        if not candidates:
+            return
+
+        async def check_one(c: dict):
+            ticker = c.get("ticker", "")
+            if not ticker:
+                return None
+            try:
+                ohlcv = c.get("_ohlcv_snapshot")
+                if ohlcv is None or (hasattr(ohlcv, "empty") and ohlcv.empty):
+                    ohlcv = await self.api_client.get_ohlcv(ticker, count=30)
+                if ohlcv.empty:
+                    return None
+                can_enter = await self.strategy.check_entry_condition(ticker, ohlcv)
+                return c if can_enter else None
+            except Exception as e:
+                logger.error(f"진입 조건 체크 오류 {ticker}: {e}")
+                return None
+
+        approved = [r for r in await asyncio.gather(*[check_one(c) for c in candidates]) if r]
+
+        for c in approved:
             ticker = c.get("ticker", "")
             reason = c.get("reason", "Momentum")
-            if not ticker:
-                continue
             try:
-                ohlcv = await self.api_client.get_ohlcv(ticker, count=30)
-                if not ohlcv.empty:
-                    can_enter = await self.strategy.check_entry_condition(ticker, ohlcv)
-                    if can_enter:
-                        result = await self.strategy.entry(ticker, reason=reason)
-                        if result and result.get("rt_cd") == "0":
-                            score = c.get("score", 0)
-                            gap = c.get("opening_gap", None)
-                            gap_str = f" | 갭: {gap:.2%}" if gap is not None else ""
-                            await self.notifier.send_message(
-                                f"📈 <b>매수</b> {ticker} ({reason})\n"
-                                f"점수: {score:.1f}{gap_str}"
-                            )
+                result = await self.strategy.entry(ticker, reason=reason)
+                if result and result.get("rt_cd") == "0":
+                    score = c.get("score", 0)
+                    gap = c.get("opening_gap", None)
+                    gap_str = f" | 갭: {gap:.2%}" if gap is not None else ""
+                    await self.notifier.send_message(
+                        f"📈 <b>매수</b> {ticker} ({reason})\n점수: {score:.1f}{gap_str}"
+                    )
             except Exception as e:
                 logger.error(f"매수 오류 {ticker}: {e}")
 
@@ -329,7 +384,10 @@ class AsyncAutoTrader:
                 "date": datetime.now().strftime("%Y-%m-%d"),
                 "mode": "DEMO" if self.demo_mode else "REAL",
                 "count": len(self.candidate_stocks),
-                "candidates": self.candidate_stocks,
+                "candidates": [
+                    {k: v for k, v in c.items() if k != "_ohlcv_snapshot"}
+                    for c in self.candidate_stocks
+                ],
             }
             with open(config.SCREENING_RESULTS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
