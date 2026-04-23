@@ -41,6 +41,29 @@ class AsyncStockScreener:
             return await self.api_client.get_top_market_stocks("1001", count=30)
         return []
 
+    async def get_volume_surge_stocks(self) -> List[tuple]:
+        """장중 거래량 급증 종목 탐색 (KOSPI 상위 30 + KOSDAQ 상위 20).
+
+        Bug #3 fix (2026-04-24): 기존에는 메서드 자체가 없어서 연속시그널 스캐너가
+        15분마다 AttributeError → 거래량 급증 종목을 단 한 번도 추적하지 못했음.
+        KIS 'get_top_market_stocks' (거래대금 상위) 를 surge proxy로 사용.
+
+        Returns:
+            [(ticker, market), ...] 형태. 연속시그널 스캐너가 기대하는 포맷.
+        """
+        pairs: List[tuple] = []
+        try:
+            kospi = await self.api_client.get_top_market_stocks("0001", count=30)
+            pairs.extend((t, "KOSPI") for t in kospi)
+        except Exception as e:
+            logger.debug(f"[get_volume_surge_stocks] KOSPI 오류: {e}")
+        try:
+            kosdaq = await self.api_client.get_top_market_stocks("1001", count=20)
+            pairs.extend((t, "KOSDAQ") for t in kosdaq)
+        except Exception as e:
+            logger.debug(f"[get_volume_surge_stocks] KOSDAQ 오류: {e}")
+        return pairs
+
     # ------------------------------------------------------------------
     # 시초가 갭 검증
     # ------------------------------------------------------------------
@@ -333,7 +356,8 @@ class AsyncStockScreener:
     # 세션별 진입 임계값
     # ------------------------------------------------------------------
 
-    def get_entry_threshold(self, is_overnight_window: bool = False) -> int:
+    def get_entry_threshold(self, is_overnight_window: bool = False,
+                            market_regime: str = "NORMAL") -> int:
         """
         현재 거래 세션에 따라 최소 진입 점수 반환.
 
@@ -648,7 +672,8 @@ class AsyncStockScreener:
     # 병렬 스크리닝 실행
     # ------------------------------------------------------------------
 
-    async def run_screening_async(self, market_list=["KOSPI", "KOSDAQ"], is_intraday: bool = False) -> list:
+    async def run_screening_async(self, market_list=["KOSPI", "KOSDAQ"], is_intraday: bool = False,
+                                  market_regime: str = "NORMAL") -> list:
         """
         asyncio.gather를 사용한 병렬 스크리닝.
         """

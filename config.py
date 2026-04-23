@@ -57,6 +57,7 @@ LOSS_CUT_RATIO = float(trading_config.get("loss_cut_ratio", 0.02))
 PROFIT_CUT_RATIO = float(trading_config.get("profit_cut_ratio", 0.05))
 MAX_STOCK_COUNT = int(trading_config.get("max_stock_count", 3))
 MAX_HOLD_DAYS = int(trading_config.get("max_hold_days", 3))
+DYNAMIC_TP_ATR_MULTIPLIER = float(trading_config.get("dynamic_tp_atr_multiplier", 2.0))
 
 # Screening 카테고리
 screen_config = config.get("screening", {})
@@ -114,7 +115,9 @@ LOG_BACKUP_COUNT = int(log_config.get("backup_count", 5))
 # 전략 관련 추가 상수 및 기타(config.py 내 자체 정의)
 TAKE_PROFIT_RATIO = PROFIT_CUT_RATIO
 STOP_LOSS_RATIO = LOSS_CUT_RATIO
-TRAILING_STOP = 0.03  
+TRAILING_STOP = 0.03
+TRAILING_MIN_PROFIT = float(trading_config.get("trailing_min_profit", 0.04))  # 트레일링 최소 활성화 수익률 (기본 4%)
+FEE_BREAKEVEN = float(trading_config.get("fee_breakeven", 0.003))             # 왕복 수수료 손익분기 (기본 0.3%)
 MAX_STOCKS = MAX_STOCK_COUNT
 PORTFOLIO_RATIO = MAX_INVESTMENT_RATIO
 STOCK_RATIO = MAX_STOCK_RATIO
@@ -124,10 +127,25 @@ WEIGHT_TECHNICAL = 40
 WEIGHT_ORDER_FLOW = 40
 WEIGHT_NEWS = 20
 
-# Overnight Betting 설정
+# Overnight Betting 설정 (v2: D+2 morning exit — 2026-04-24 rebuild)
+# 구버전 버그: "now_str >= '09:05'" 문자열 비교로 15:10 매수 시 즉시 청산됨.
+# 신버전: today > entry_date 가드 + D+2 오전 강제 청산 + 조기 TP.
 OVERNIGHT_BUY_START = "15:10"
 OVERNIGHT_BUY_END = "15:20"
-OVERNIGHT_SELL_TIME = "09:05"
+OVERNIGHT_SELL_START = "09:05"      # D+2 오전 청산 시작
+OVERNIGHT_SELL_END = "09:30"        # D+2 오전 청산 마감 (이후엔 종가권)
+OVERNIGHT_MAX_HOLD_DAYS = 2         # D+2에 강제 청산
+OVERNIGHT_TAKE_PROFIT = 0.05        # D+1 장중 +5% 달성 시 조기 청산
+OVERNIGHT_HARD_STOP = 0.04          # 시점 무관 -4% 하드 스탑
+# Deprecated: 하위 호환용 (새 로직은 OVERNIGHT_SELL_START/END 사용)
+OVERNIGHT_SELL_TIME = OVERNIGHT_SELL_START
+
+# ── C 패치 (Shadow 모드) — 트레일링 스탑 로깅 전용 ─────────────────────
+# 매매에는 전혀 영향 없음. [SHADOW_C] 로그로 B와 병행 비교 후 평가.
+OVERNIGHT_SHADOW_C_ENABLED = True
+OVERNIGHT_TRAILING_STOP = 0.03          # D+1 고점 대비 3% 하락 시 가상 청산
+OVERNIGHT_TRAILING_ACTIVATION = 0.015   # 트레일링 활성화 기준 (+1.5%)
+OVERNIGHT_RUNNER_TP = 0.10              # 극단 이익(+10%) 확정 (스파이크 대응)
 
 MORNING_ENTRY_START = "09:00"
 MORNING_ENTRY_END = "09:05"
@@ -142,6 +160,30 @@ MIN_INTRADAY_VOLUME_RATIO = 0.5 # 50% of avg daily volume reached
 INTRADAY_MOMENTUM_WEIGHT = 1.5  # Boost score if price > open and volume surging
 
 BACKTEST_MODE = os.getenv("BACKTEST_MODE", "False").lower() == "true"
+
+# ── 시장 체제별 전략 파라미터 (config.yaml market_regimes) ──────────────────
+_regime_config = config.get("market_regimes", {})
+_risk_threshold_config = config.get("risk_thresholds", {})
+
+# 리스크 임계값 (하드코딩 제거)
+VOLATILITY_CAUTION   = float(_risk_threshold_config.get("volatility_caution", 35))
+VOLATILITY_RISK      = float(_risk_threshold_config.get("volatility_risk", 70))
+VOLATILITY_VOLATILE  = float(_risk_threshold_config.get("volatility_volatile", 45))
+RISK_POSITION_MULTIPLIER = _risk_threshold_config.get(
+    "position_size_multiplier", {"NORMAL": 1.0, "CAUTION": 0.7, "RISK": 0.4}
+)
+
+_DEFAULT_REGIME = "NORMAL"
+
+
+def get_regime_params(regime: str) -> dict:
+    """시장 체제별 전략 파라미터 반환.
+
+    M1: common_strategy_params를 기본으로 깔고, regime별 특화값을 덮어씌움.
+    """
+    common = config.get("common_strategy_params", {})
+    regime_specific = _regime_config.get(regime, _regime_config.get(_DEFAULT_REGIME, {}))
+    return {**common, **regime_specific}
 
 # 공통 데이터 디렉토리 설정 
 DATA_DIR = Path("data")
@@ -176,4 +218,12 @@ CACHE_CONFIG = {
     "CACHE_DIR": "cache",
     "CACHE_DEFAULT_TIMEOUT": 1800,
     "CACHE_THRESHOLD": 1000,
+}
+
+# 로직 강화 옵션 (Refinements)
+STATUS_REPORT_INTERVAL_MINUTES = 60 # 하트비트 보고 주기
+TRAILING_STEPS = {
+    # 달성 수익률 : 하락 허용폭(Trailing Threshold)
+    0.10: 0.02, # 10% 돌파 시, 고점 대비 2% 하락하면 분할청산
+    0.05: 0.03  # 5% 돌파 시, 고점 대비 3% 하락하면 분할청산
 }

@@ -19,6 +19,9 @@ class AsyncTradingStrategy:
         self.holdings = {}
         self.order_history = []
         self.pending_orders = {}
+        self._selling_tickers: set = set()   # Issue #20: 매도 진행 중 종목 (중복 주문 방지)
+        self._recently_sold: dict = {}        # Issue #21: 최근 매도 {ticker: unix_ts} (30분 쿨다운)
+        self._holdings_lock = asyncio.Lock()  # Holdings 동시 접근 방지
 
         self.take_profit_ratio = config.TAKE_PROFIT_RATIO
         self.stop_loss_ratio = config.STOP_LOSS_RATIO
@@ -29,6 +32,10 @@ class AsyncTradingStrategy:
          self.candidate_stocks = candidate_stocks
 
     async def update_holdings(self):
+         async with self._holdings_lock:
+             await self._update_holdings_inner()
+
+    async def _update_holdings_inner(self):
          account_info = await self.api_client.get_account_summary()
          if not account_info:
               return
@@ -58,7 +65,8 @@ class AsyncTradingStrategy:
                    
               self.holdings[ticker] = current_info
               
-    async def check_entry_condition(self, ticker: str, ohlcv_data: pd.DataFrame) -> bool:
+    async def check_entry_condition(self, ticker: str, ohlcv_data: pd.DataFrame,
+                                    market_regime: str = "NORMAL") -> bool:
          status = get_trading_time_status()
          if status not in ["REGULAR", "OPENING_AUCTION"]:
               return False
@@ -77,8 +85,10 @@ class AsyncTradingStrategy:
          delta = ohlcv_data["close"].diff()
          gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
          loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-         rs = gain / loss
+         rs = gain / loss.replace(0, float('nan'))
          rsi14 = (100 - (100 / (1 + rs))).iloc[-1]
+         if pd.isna(rsi14):
+             rsi14 = 100.0  # 전부 상승 → RSI 100
 
          # Condition A: Strong momentum pullback (RSI between 40 and 60, price bounded by MAs)
          if ma20 < current_price < ma5 and 40 <= rsi14 <= 60:
@@ -90,7 +100,62 @@ class AsyncTradingStrategy:
 
          return False
 
-    async def check_exit_condition(self, ticker: str) -> tuple[bool, str]:
+    def _b_overnight_decision(self, profit_ratio: float, days_held: int,
+                              now_str: str) -> tuple[bool, str]:
+        """B 패치 Overnight 청산 로직 (실제 매매용)."""
+        # (1) 하드 스탑 — 시점 무관
+        if profit_ratio <= -config.OVERNIGHT_HARD_STOP:
+            return True, f"Overnight Hard Stop {profit_ratio:.2%}"
+        # (2) D+0: 무조건 보유
+        if days_held < 1:
+            return False, "Hold Overnight (D+0)"
+        # (3) D+1: +5% 조기 익절
+        if days_held == 1:
+            if profit_ratio >= config.OVERNIGHT_TAKE_PROFIT:
+                return True, f"Overnight D+1 TP {profit_ratio:.2%}"
+            return False, f"Hold Overnight (D+1 {profit_ratio:+.2%})"
+        # (4) D+2 이상: 오전 또는 종가권 강제 청산
+        if days_held >= config.OVERNIGHT_MAX_HOLD_DAYS:
+            if config.OVERNIGHT_SELL_START <= now_str <= config.OVERNIGHT_SELL_END:
+                return True, f"Overnight D+{days_held} Morning Exit at {now_str}"
+            if now_str >= "14:00":
+                return True, f"Overnight D+{days_held} Close Exit at {now_str}"
+            return False, f"Hold Overnight (D+{days_held} pre-window)"
+        return False, "Hold Overnight"
+
+    def _shadow_c_overnight_decision(self, holding_info: dict, profit_ratio: float,
+                                     days_held: int, now_str: str) -> tuple[bool, str]:
+        """C 패치 트레일링 스탑 로직 (Shadow 모드 — 로깅 전용, 매매 영향 없음)."""
+        buy_price = holding_info.get("buy_price", 0) or 1
+        current_price = holding_info.get("current_price", 0)
+        high = holding_info.get("high_price", current_price) or current_price
+
+        # 하드 스탑 (B와 동일)
+        if profit_ratio <= -config.OVERNIGHT_HARD_STOP:
+            return True, f"Hard Stop {profit_ratio:.2%}"
+        # D+0 보유
+        if days_held < 1:
+            return False, "Hold D+0"
+        # D+1: 트레일링 + 러너 TP
+        if days_held == 1:
+            activation_level = buy_price * (1 + config.OVERNIGHT_TRAILING_ACTIVATION)
+            if high > activation_level and current_price > 0:
+                drop = 1 - current_price / high
+                if drop >= config.OVERNIGHT_TRAILING_STOP:
+                    return True, f"D+1 Trailing {drop:.2%} peak +{high/buy_price-1:.2%}"
+            if profit_ratio >= config.OVERNIGHT_RUNNER_TP:
+                return True, f"D+1 Runner TP {profit_ratio:.2%}"
+            return False, f"Hold D+1 peak +{high/buy_price-1:.2%}"
+        # D+2 이상: B와 동일 강제 청산
+        if days_held >= config.OVERNIGHT_MAX_HOLD_DAYS:
+            if config.OVERNIGHT_SELL_START <= now_str <= config.OVERNIGHT_SELL_END:
+                return True, f"D+{days_held} Morning"
+            if now_str >= "14:00":
+                return True, f"D+{days_held} Close"
+            return False, f"Hold D+{days_held}"
+        return False, "Hold"
+
+    async def check_exit_condition(self, ticker: str, market_regime: str = "NORMAL") -> tuple[bool, str]:
          if ticker not in self.holdings:
               return False, "Not held"
               
@@ -113,17 +178,38 @@ class AsyncTradingStrategy:
          # For backward compatibility, if 'reason' doesn't exist, we treat it as standard
          strategy_type = holding_info.get("reason", "Standard")
          
-         # --- 1. OVERNIGHT EXIT LOGIC ---
+         # --- 1. OVERNIGHT EXIT LOGIC (v2: 2026-04-24) ---
+         # Bug history: 이전 로직은 "now_str >= '09:05'" 문자열 사전식 비교 때문에
+         # 15:10 매수 직후 exit 체크에서 '15:10' >= '09:05' 참 → 즉시 청산되어
+         # 26건 연속 슬리피지 손실 누적.
+         # Fix: today > entry_date 가드 + D+2 오전 강제 청산 + D+1 조기 TP.
+         # Shadow C (2026-04-24): 트레일링 스탑 로직을 로그로 병행 기록. 실제 매매 영향 없음.
          if strategy_type == "Overnight":
               now_str = datetime.now().strftime("%H:%M")
-              if now_str >= config.OVERNIGHT_SELL_TIME:
-                   return True, f"Overnight Morning Exit at {now_str}"
-              
-              # Fallback stop loss for overnight if it drops drastically right at open
-              if profit_ratio <= -self.stop_loss_ratio * 1.5: 
-                   return True, f"Overnight Hard Stop {profit_ratio:.2%}"
-                   
-              return False, "Hold Overnight"
+              entry_date = holding_info["entry_time"].date()
+              today = datetime.now().date()
+              days_held = (today - entry_date).days
+
+              # B 결정 계산 (실제 매매)
+              b_exit, b_reason = self._b_overnight_decision(
+                   profit_ratio, days_held, now_str
+              )
+
+              # C 결정 계산 (Shadow 로깅만)
+              if getattr(config, "OVERNIGHT_SHADOW_C_ENABLED", False):
+                   c_exit, c_reason = self._shadow_c_overnight_decision(
+                        holding_info, profit_ratio, days_held, now_str
+                   )
+                   high = holding_info.get("high_price", current_price)
+                   high_gain = (high / holding_info["buy_price"] - 1) if holding_info["buy_price"] else 0
+                   logger.info(
+                        f"[SHADOW_C] {ticker} D+{days_held} pnl={profit_ratio:+.2%} "
+                        f"peak={high_gain:+.2%} "
+                        f"B={'EXIT' if b_exit else 'HOLD'} C={'EXIT' if c_exit else 'HOLD'} "
+                        f"C_reason={c_reason}"
+                   )
+
+              return b_exit, b_reason
               
          # --- 2. MOMENTUM / INTRADAY / DAY TRADE LOGIC ---
          # 스크리너는 "Overnight" / "Intraday" / "Momentum" 태그 반환 (Issue #9-D)
