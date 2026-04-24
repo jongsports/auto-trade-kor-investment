@@ -697,6 +697,73 @@ class AsyncKisAPI:
             logger.warning(f"뉴스 제목 조회 실패 {ticker}: {e}")
             return []
 
+    async def get_market_investor_flow(self, market: str = "KOSPI") -> Dict[str, Any]:
+        """시장별 투자자매매동향(시세) — FHPTJ04030000.
+
+        KODEX200 proxy 대체 (2026-04-24): ETF 기반 투자자 추정이 Primary API
+        미지원으로 항상 0 반환하던 구조 문제 해결. 시장 전체 외국인/기관/개인
+        순매수 집계를 1회 호출로 획득.
+
+        Args:
+            market: "KOSPI" 또는 "KOSDAQ"
+        Returns:
+            {
+              market, data_available,
+              foreign_net_amount_bn, institution_net_amount_bn, personal_net_amount_bn  (억원),
+              foreign_net_qty, institution_net_qty, personal_net_qty  (주)
+            }
+        """
+        mkt = market.upper()
+        if mkt == "KOSPI":
+            iscd, iscd2 = "KSP", "0001"
+        elif mkt == "KOSDAQ":
+            iscd, iscd2 = "KSQ", "1001"
+        else:
+            return {"market": market, "data_available": False}
+
+        try:
+            res = await self._fetch(
+                "GET",
+                "/uapi/domestic-stock/v1/quotations/inquire-investor-time-by-market",
+                "FHPTJ04030000",
+                params={
+                    "FID_INPUT_ISCD": iscd,
+                    "FID_INPUT_ISCD_2": iscd2,
+                },
+            )
+            if res.get("rt_cd") != "0":
+                logger.warning(
+                    f"[MarketFlow] {mkt} API 오류 rt_cd={res.get('rt_cd')} "
+                    f"msg_cd={res.get('msg_cd')} msg1={res.get('msg1')}"
+                )
+                return {"market": mkt, "data_available": False}
+
+            output = res.get("output")
+            if not output or not isinstance(output, list):
+                return {"market": mkt, "data_available": False}
+            row = output[0]
+
+            def _to_int(v) -> int:
+                try:
+                    return int(str(v).strip()) if v not in (None, "") else 0
+                except Exception:
+                    return 0
+
+            # 거래대금 필드는 백만원 단위 → 억원 변환 (÷100)
+            return {
+                "market": mkt,
+                "data_available": True,
+                "foreign_net_amount_bn":     round(_to_int(row.get("frgn_ntby_tr_pbmn")) / 100, 1),
+                "institution_net_amount_bn": round(_to_int(row.get("orgn_ntby_tr_pbmn")) / 100, 1),
+                "personal_net_amount_bn":    round(_to_int(row.get("prsn_ntby_tr_pbmn")) / 100, 1),
+                "foreign_net_qty":     _to_int(row.get("frgn_ntby_qty")),
+                "institution_net_qty": _to_int(row.get("orgn_ntby_qty")),
+                "personal_net_qty":    _to_int(row.get("prsn_ntby_qty")),
+            }
+        except Exception as e:
+            logger.warning(f"[MarketFlow] {mkt} 조회 실패: {e}")
+            return {"market": mkt, "data_available": False}
+
     async def get_top_market_stocks(self, market_code="0001", count=200) -> List[str]:
         """
         국내주식 거래대금 상위 종목 조회 (FHPST01710000)

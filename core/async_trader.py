@@ -665,8 +665,10 @@ class AsyncAutoTrader:
                                     logger.debug(f"[신규 포착] {ticker} 스코어링 실패: {e}")
                                 return None
 
+                        # 2026-04-24: 기존 [:10] 캡으로 49종 발견해도 10개만 스코어링 → 대부분 기회 상실.
+                        # 20개로 상향 (demo 모드에선 TPS 부담 커지지만 실전에선 semaphore=20이라 여유).
                         results = await asyncio.gather(
-                            *[_score_surge(t, m) for t, m in new_pairs[:10]]
+                            *[_score_surge(t, m) for t, m in new_pairs[:20]]
                         )
                         for result in results:
                             if result:

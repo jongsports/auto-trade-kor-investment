@@ -635,6 +635,11 @@ class AsyncStockScreener:
 
             # 6. 세션별 임계값 필터
             threshold = self.get_entry_threshold(is_overnight_window)
+            # Bug fix (2026-04-24): 수급 API 실패 시 (09:30 이전 시간대 또는 KIS 이슈)
+            # 수급 30점이 항상 0점 → 스코어 상한 70점 → 임계값 55 미달 구조 문제.
+            # data_available=False일 때 임계값을 0.75배로 완화 (55→41) — 수급 없이도 후보 선정 가능.
+            if not investor_trend.get("data_available", True):
+                threshold = max(1, int(threshold * 0.75))
             if total_score < threshold:
                 return {}
 
