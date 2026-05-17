@@ -1,0 +1,108 @@
+name: 🚀 Deploy KOR Stock Trading Bot
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+# ============================================================
+# GitHub Repo Secrets 등록 필요:
+#   APP_KEY / APP_SECRET / ACCOUNT_NUMBER (KIS OpenAPI)
+#   DART_API_KEY
+#   TELEGRAM_TOKEN / TELEGRAM_CHAT_ID
+#   DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD
+# ============================================================
+
+jobs:
+  # ─── 1단계: 테스트 ─────────────────────────────────────────
+  test:
+    name: 🧪 Run Tests
+    runs-on: [self-hosted, Linux, X64]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Python 문법 검사
+        run: |
+          python3 -m py_compile main.py
+          python3 -m py_compile config.py
+          python3 -m py_compile core/trader_api.py
+          python3 -m py_compile core/async_trader.py
+          python3 -m py_compile strategy/async_screener.py
+          python3 -m py_compile strategy/async_trading_strategy.py
+          echo "✅ 문법 검사 통과"
+
+  # ─── 2단계: 배포 ───────────────────────────────────────────
+  deploy:
+    name: 🚀 Deploy
+    runs-on: [self-hosted, Linux, X64]
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: 최신 코드 확인
+        run: |
+          echo "📦 브랜치: ${{ github.ref_name }}"
+          echo "📝 커밋: ${{ github.sha }}"
+
+      - name: .env 파일 생성 (GitHub Secrets → 파일)
+        run: |
+          printf "APP_KEY=%s\n" "${{ secrets.APP_KEY }}" > .env
+          printf "APP_SECRET=%s\n" "${{ secrets.APP_SECRET }}" >> .env
+          printf "ACCOUNT_NUMBER=%s\n" "${{ secrets.ACCOUNT_NUMBER }}" >> .env
+          printf "DART_API_KEY=%s\n" "${{ secrets.DART_API_KEY }}" >> .env
+          printf "TELEGRAM_TOKEN=%s\n" "${{ secrets.TELEGRAM_TOKEN }}" >> .env
+          printf "TELEGRAM_CHAT_ID=%s\n" "${{ secrets.TELEGRAM_CHAT_ID }}" >> .env
+          printf "DB_HOST=%s\n" "${{ secrets.DB_HOST }}" >> .env
+          printf "DB_PORT=%s\n" "${{ secrets.DB_PORT }}" >> .env
+          printf "DB_NAME=%s\n" "${{ secrets.DB_NAME }}" >> .env
+          printf "DB_USER=%s\n" "${{ secrets.DB_USER }}" >> .env
+          printf "DB_PASSWORD=%s\n" "${{ secrets.DB_PASSWORD }}" >> .env
+          echo "✅ .env 생성 완료 ($(grep -c '=' .env)개 항목)"
+
+      - name: 영구 데이터 디렉터리 생성
+        run: |
+          mkdir -p /home/jongseung/kor-trade-data/logs
+          mkdir -p /home/jongseung/kor-trade-data/data
+          echo "✅ 데이터 디렉터리 준비 완료"
+
+      - name: Docker 이미지 빌드
+        run: docker compose build
+
+      - name: 봇 재시작
+        run: docker compose up -d --force-recreate kor-trade-live
+
+      - name: 사용하지 않는 이미지 정리
+        run: docker image prune -f
+
+      - name: 배포 상태 확인
+        run: |
+          echo "✅ 배포 완료!"
+          docker compose ps
+
+  # ─── 3단계: 결과 ───────────────────────────────────────────
+  notify:
+    name: 📢 Notify Result
+    runs-on: [self-hosted, Linux, X64]
+    needs: [test, deploy]
+    if: always()
+
+    steps:
+      - name: Success
+        if: ${{ needs.deploy.result == 'success' }}
+        run: echo "✅ 배포 성공 - $(date '+%Y-%m-%d %H:%M:%S')"
+
+      - name: Failure
+        if: ${{ needs.deploy.result == 'failure' }}
+        run: |
+          echo "❌ 배포 실패! Actions 로그를 확인하세요."
+          exit 1

@@ -1,0 +1,60 @@
+services:
+
+  kor-trade-live:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kor-trade:latest
+    container_name: kor-trade-live
+    restart: unless-stopped
+    network_mode: host
+
+    env_file:
+      - .env
+
+    environment:
+      - TZ=Asia/Seoul
+
+    volumes:
+      - /home/jongseung/kor-trade-data/logs:/app/logs
+      - /home/jongseung/kor-trade-data/data:/app/data
+
+    command: python main.py
+
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 512M
+        reservations:
+          memory: 256M
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  kor-trade-demo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kor-trade:latest
+    container_name: kor-trade-demo
+    restart: "no"
+    network_mode: host
+
+    env_file:
+      - .env
+
+    environment:
+      - TZ=Asia/Seoul
+
+    volumes:
+      - /home/jongseung/kor-trade-data/logs:/app/logs
+      - /home/jongseung/kor-trade-data/data:/app/data
+
+    command: python main.py --demo
+
+    profiles:
+      - demo
