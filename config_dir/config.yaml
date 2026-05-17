@@ -1,67 +1,144 @@
-# API 설정
 api:
-  app_key: "APP_KEY_FROM_ENV" # 실제 키는 .env 파일에서 관리
-  app_secret: "APP_SECRET_FROM_ENV" # 실제 키는 .env 파일에서 관리
-  account_number: "ACCOUNT_NUMBER_FROM_ENV" # 실제 계좌번호는 .env 파일에서 관리
-  account_code: "01"
+  app_key: APP_KEY_FROM_ENV
+  app_secret: APP_SECRET_FROM_ENV
+  account_number: ACCOUNT_NUMBER_FROM_ENV
+  account_code: '01'
   demo_mode: true
-
-# 거래 설정
 trading:
-  max_position_size: 0.1 # 전체 자본 대비 최대 포지션 크기
-  max_daily_loss: 0.02 # 일일 최대 손실 한도
-  stop_loss_pct: 0.05 # 기본 손절 비율
-  volatility_lookback: 20 # 변동성 계산 기간
-  max_stock_ratio: 0.1 # 종목당 최대 포지션 비중
-  max_investment_ratio: 0.2 # 총 투자 비중 (예: 20%)
-  loss_cut_ratio: 0.02 # 기본 손절 비율 (예: 2%)
-  profit_cut_ratio: 0.05 # 기본 익절 비율 (예: 5%)
-  max_stock_count: 3 # 최대 보유 종목 수
-  max_hold_days: 3 # 최대 보유 일수
-
-# 알림 설정
+  max_position_size: 0.1
+  max_daily_loss: 0.02
+  stop_loss_pct: 0.05
+  volatility_lookback: 20
+  max_stock_ratio: 0.1
+  max_investment_ratio: 0.2
+  loss_cut_ratio: 0.0466
+  profit_cut_ratio: 0.1436
+  max_stock_count: 3
+  max_hold_days: 2
 notifications:
   telegram:
     enabled: true
-    token: ""      # 실제 토큰은 .env 파일에서 관리
-    chat_id: ""    # 실제 채널 ID는 .env 파일에서 관리
-
+    token: ''
+    chat_id: ''
   email:
     enabled: false
-    sender: ""
-    recipient: ""
-    smtp_server: ""
+    sender: ''
+    recipient: ''
+    smtp_server: ''
     smtp_port: 587
-    username: ""
-    password: ""
-
-# 로깅 설정
+    username: ''
+    password: ''
 logging:
-  level: "INFO"
-  file: "logs/auto_trade.log"
-  max_size: 10485760 # 10MB
+  level: INFO
+  file: logs/auto_trade.log
+  max_size: 10485760
   backup_count: 5
-
-# 백테스팅 설정
 backtesting:
-  start_date: "2023-01-01"
-  end_date: "2023-12-31"
-  initial_capital: 100000000 # 1억원
-  commission: 0.00015 # 0.015%
-  slippage: 0.0001 # 0.01%
-
-# 스크리닝 설정
+  start_date: '2023-01-01'
+  end_date: '2023-12-31'
+  initial_capital: 100000000
+  commission: 0.00015
+  slippage: 0.0001
 screening:
-  min_market_cap: 100000000000 # 1000억원
-  min_volume: 100000 # 일일 거래량
-  min_volatility: 0.01 # 최소 변동성
-  max_volatility: 0.5 # 최대 변동성
-  min_price: 1000 # 최소 주가
-  max_price: 1000000 # 최대 주가
-  momentum_days: 3 # 모멘텀 확인 기간
-  min_gap_up: 0.02 # 최소 갭업 비율
-  min_volume_ratio: 2.5 # 최소 거래량 증가 비율
-  min_amount_ratio: 3.0 # 최소 거래대금 증가 비율
-  min_ma5_ratio: 0.03 # 5일 이동평균선 이격도 최소 비율
-  opening_gap_down_threshold: 0.03 # 시초가 갭하락 필터 임계값 (3% 이상 갭하락 제외)
-  opening_gap_up_threshold: 0.05   # 시초가 갭상승 추격방지 임계값 (5% 이상 갭상승 제외)
+  min_market_cap: 100000000000
+  min_volume: 100000
+  min_volatility: 0.01
+  max_volatility: 0.5
+  min_price: 1000
+  max_price: 1000000
+  momentum_days: 3
+  min_gap_up: 0.02
+  min_volume_ratio: 2.5
+  min_amount_ratio: 3.0
+  min_ma5_ratio: 0.03
+  opening_gap_down_threshold: 0.03
+  opening_gap_up_threshold: 0.05
+market_regimes:
+  BULL:
+    score_threshold_boost: 5
+    volume_multiplier_min: 2.0
+    overnight_bonus_extra: 5
+    rsi_oversold: 45
+    rsi_overbought: 75
+    adx_min: 20
+    bb_width_min: 0.03
+    momentum_tp_ratio: 0.05
+    momentum_sl_ratio: 0.025
+    trailing_stop: 0.025
+    max_hold_days: 3
+    position_size_multiplier: 1.2
+    max_stock_count: 6
+  NORMAL:
+    score_threshold_boost: 0
+    volume_multiplier_min: 2.5
+    overnight_bonus_extra: 0
+    rsi_oversold: 42
+    rsi_overbought: 70
+    adx_min: 25
+    bb_width_min: 0.04
+    momentum_tp_ratio: 0.04
+    momentum_sl_ratio: 0.025
+    trailing_stop: 0.03
+    max_hold_days: 5
+    position_size_multiplier: 1.0
+    max_stock_count: 5
+  BEAR:
+    score_threshold_boost: -10
+    volume_multiplier_min: 3.5
+    overnight_bonus_extra: -10
+    rsi_oversold: 30
+    rsi_overbought: 60
+    adx_min: 30
+    bb_width_min: 0.06
+    momentum_tp_ratio: 0.03
+    momentum_sl_ratio: 0.02
+    trailing_stop: 0.02
+    max_hold_days: 2
+    position_size_multiplier: 0.6
+    max_stock_count: 3
+  VOLATILE:
+    score_threshold_boost: -5
+    volume_multiplier_min: 3.0
+    overnight_bonus_extra: -5
+    rsi_oversold: 38
+    rsi_overbought: 65
+    adx_min: 35
+    bb_width_min: 0.02
+    momentum_tp_ratio: 0.06
+    momentum_sl_ratio: 0.03
+    trailing_stop: 0.04
+    max_hold_days: 2
+    position_size_multiplier: 0.8
+    max_stock_count: 4
+  VOLATILE_UP:
+    score_threshold_boost: -5
+    volume_multiplier_min: 3.0
+    overnight_bonus_extra: 0
+    rsi_oversold: 42
+    rsi_overbought: 70
+    adx_min: 30
+    bb_width_min: 0.02
+    momentum_tp_ratio: 0.07
+    momentum_sl_ratio: 0.03
+    trailing_stop: 0.04
+    max_hold_days: 2
+    position_size_multiplier: 0.9
+    max_stock_count: 4
+  VOLATILE_DOWN:
+    score_threshold_boost: -10
+    volume_multiplier_min: 3.5
+    overnight_bonus_extra: -10
+    rsi_oversold: 35
+    rsi_overbought: 60
+    adx_min: 35
+    bb_width_min: 0.02
+    momentum_tp_ratio: 0.04
+    momentum_sl_ratio: 0.025
+    trailing_stop: 0.03
+    max_hold_days: 1
+    position_size_multiplier: 0.6
+    max_stock_count: 3
+risk_thresholds:
+  volatility_caution: 30
+  volatility_volatile: 40
+  volatility_risk: 55

@@ -21,7 +21,7 @@ class AsyncRiskManager:
         # Limits
         self.max_position_size = config.MAX_STOCK_RATIO
         self.max_total_position = config.MAX_INVESTMENT_RATIO
-        self.position_size_multiplier = {"NORMAL": 1.0, "CAUTION": 0.7, "RISK": 0.4}
+        self.position_size_multiplier = dict(config.RISK_POSITION_MULTIPLIER)
 
         # 일일 손익 추적 (C3)
         self._daily_realized_pnl: float = 0.0
@@ -46,13 +46,15 @@ class AsyncRiskManager:
                 return
 
             returns = kospi_data["close"].pct_change().dropna()
-            volatility = returns.std() * np.sqrt(252) * 100
-            # Issue #12: adjusted_volatility 1.2배 가산 제거 — 과대 계산으로 인한 과잉 차단 방지
-            # 임계값: CAUTION > 30%, RISK > 50% (역사적 KOSPI 변동성 15~35% 기준)
-            logger.info(f"Market Volatility: {volatility:.2f}%")
-            if volatility > 50:
+            # Issue #23: EWMA 변동성 (span=20) — 단순 std보다 안정적이고 최근 변동에 가중
+            # FHKST01010400이 30행만 반환하므로 단순 std는 극단값에 과민 반응
+            ewma_var = returns.ewm(span=min(20, len(returns))).var().iloc[-1]
+            volatility = np.sqrt(ewma_var) * np.sqrt(252) * 100
+            simple_vol = returns.std() * np.sqrt(252) * 100
+            logger.info(f"Market Volatility: EWMA={volatility:.2f}% (simple={simple_vol:.2f}%, samples={len(returns)})")
+            if volatility > config.VOLATILITY_RISK:
                 self.risk_status = "RISK"
-            elif volatility > 30:
+            elif volatility > config.VOLATILITY_CAUTION:
                 self.risk_status = "CAUTION"
             else:
                 self.risk_status = "NORMAL"
@@ -62,7 +64,13 @@ class AsyncRiskManager:
             ma60 = kospi_data["close"].rolling(min(60, n)).mean().iloc[-1]
             current = kospi_data["close"].iloc[-1]
 
-            if current > ma20 > ma60:
+            if volatility > config.VOLATILITY_VOLATILE:
+                # 고변동성 구간: 방향에 따라 VOLATILE_UP / VOLATILE_DOWN 세분화
+                if current >= ma20:
+                    self.market_condition = "VOLATILE_UP"
+                else:
+                    self.market_condition = "VOLATILE_DOWN"
+            elif current > ma20 > ma60:
                 self.market_condition = "BULL"
             elif current < ma20 < ma60:
                 self.market_condition = "BEAR"
@@ -73,6 +81,10 @@ class AsyncRiskManager:
 
         except Exception as e:
             logger.error(f"Market risk assessment error: {e}")
+            # 실패 시 보수적 기본값으로 전환 (stale BULL 상태 방지)
+            self.risk_status = "CAUTION"
+            if self.market_condition in ("BULL",):
+                self.market_condition = "NORMAL"
 
     async def calculate_position_size(self, ticker: str, account_balance: float) -> float:
         """변동성 역비례 포지션 사이징 (R4).
@@ -88,12 +100,21 @@ class AsyncRiskManager:
             returns = price_data["close"].pct_change().dropna()
             volatility = returns.std() * np.sqrt(252)
             vol_factor = 0.2 / volatility if volatility > 0 else 1.0
-            risk_mult = self.position_size_multiplier.get(self.risk_status, 1.0)
-            position_size = self.max_position_size * vol_factor * risk_mult
-            # 상한: max×2 / 하한: max×0.1
-            position_size = max(self.max_position_size * 0.1,
-                                min(position_size, self.max_position_size * 2.0))
-            logger.debug(f"[{ticker}] 포지션: vol={volatility:.2%} factor={vol_factor:.2f} → {position_size:.2%}")
+
+            # P4: config 기반 통합 배율 (단일 소스)
+            regime = self.market_condition or "NORMAL"
+            rp = config.get_regime_params(regime)
+            regime_mult = rp.get("position_size_multiplier", 1.0)
+            risk_mult = config.RISK_POSITION_MULTIPLIER.get(self.risk_status, 1.0)
+
+            position_size = self.max_position_size * vol_factor * regime_mult * risk_mult
+            # 상한: max×1.5 / 하한: max×0.3 (2.0→1.5 하향: 단일 종목 과집중 방지)
+            position_size = max(self.max_position_size * 0.3,
+                                min(position_size, self.max_position_size * 1.5))
+            logger.info(
+                f"[PosSizing-RM] {ticker}: vol={volatility:.2%} × regime={regime_mult:.2f} "
+                f"× risk={risk_mult:.2f} → {position_size:.2%}"
+            )
             return account_balance * position_size
         except Exception as e:
             logger.error(f"포지션 사이징 오류 {ticker}: {e}")
@@ -143,11 +164,11 @@ class AsyncRiskManager:
             if not is_trading_time():
                 return False, "Not trading time."
         if self.risk_status == "RISK" and order_type == "buy":
-            # Issue #12: BULL 추세 + 고변동성 조합에서는 완전 차단 대신 포지션 축소로 대응
-            # BEAR 또는 NORMAL 시장에서 RISK 상태면 매수 중단
-            if self.market_condition != "BULL":
-                return False, "Market is in extreme RISK."
-            logger.warning("[RISK+BULL] 고변동성이나 BULL 추세 — 포지션 사이징 RISK 배율(0.4) 적용 후 허용")
+            # Issue #23: BEAR에서만 완전 차단, 나머지 체제는 포지션 축소 후 허용
+            # 기존: BULL만 허용 → VOLATILE_DOWN에서 매수 전면 차단 (오작동)
+            if self.market_condition == "BEAR":
+                return False, "Market is BEAR + RISK — 매수 차단."
+            logger.warning(f"[RISK+{self.market_condition}] 고변동성 — 포지션 사이징 RISK 배율({self.position_size_multiplier.get('RISK', 0.4)}) 적용 후 허용")
 
         # 일일 최대 손실 한도 체크 (C3)
         if order_type == "buy":
@@ -179,16 +200,16 @@ class AsyncRiskManager:
                 if order_amount > 0 and available < order_amount:
                     return False, f"가용 잔고 부족 (필요: {order_amount:,}원, 가용: {available:,}원)"
 
-                # 전체 투자 비율 체크
+                # 전체 투자 비율 체크 (매수 후 비율 기준)
                 total_eval = account.get("total_evaluated_amount", 0)
                 if total_eval > 0:
                     invested = sum(
                         int(p.get("current_price", 0)) * int(p.get("quantity", 0))
                         for p in positions
                     )
-                    invest_ratio = invested / total_eval
-                    if invest_ratio >= config.MAX_INVESTMENT_RATIO:
-                        return False, f"최대 투자 비율 초과 ({invest_ratio:.1%}/{config.MAX_INVESTMENT_RATIO:.1%})"
+                    post_trade_ratio = (invested + order_amount) / total_eval
+                    if post_trade_ratio >= config.MAX_INVESTMENT_RATIO:
+                        return False, f"최대 투자 비율 초과 ({post_trade_ratio:.1%}/{config.MAX_INVESTMENT_RATIO:.1%})"
 
             except Exception as e:
                 logger.warning(f"can_trade 잔고 체크 오류: {e}")

@@ -10,3 +10,5 @@ schedule>=1.2.1
 python-dotenv>=1.0.1
 matplotlib>=3.8.0
 certifi
+asyncpg>=0.29.0
+optuna>=3.0.0

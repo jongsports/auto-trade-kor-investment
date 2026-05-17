@@ -31,13 +31,14 @@ class BacktestConfig:
     initial_capital: float = config.BACKTEST_INITIAL_CAPITAL
     commission: float = config.BACKTEST_COMMISSION      # 편도 수수료 (0.015%)
     slippage: float = config.BACKTEST_SLIPPAGE          # 슬리피지 (0.01%)
-    score_threshold: int = 45                            # 진입 최소 점수 (수급 0 처리 시 최대=60, 45=75%)
-    max_positions: int = config.MAX_STOCKS               # 최대 동시 보유 종목
-    take_profit: float = config.TAKE_PROFIT_RATIO        # 익절 비율 (5%)
-    stop_loss: float = config.STOP_LOSS_RATIO            # 손절 비율 (2%)
-    trailing_stop: float = config.TRAILING_STOP          # 트레일링 스탑 (3%)
-    max_hold_days: int = config.MAX_HOLD_DAYS            # 최대 보유일
-    position_size_ratio: float = config.MAX_STOCK_RATIO  # 종목당 자본 비중 (10%)
+    score_threshold: int = 45                            # api_test 검증: PF 1.49
+    max_positions: int = 3                               # api_test 검증: 집중 투자
+    take_profit: float = 0.05                            # api_test 검증: 5%
+    stop_loss: float = 0.02                              # api_test 검증: 2%
+    trailing_stop: float = 0.03                          # api_test 검증: 3%
+    max_hold_days: int = 3                               # api_test 검증: 3일
+    position_size_ratio: float = 0.15                    # 15%: 고확률 거래에 충분한 비중
+    market_regime: Optional[str] = None                  # 체제 고정 (BULL/BEAR/NORMAL 등)
 
 
 @dataclass

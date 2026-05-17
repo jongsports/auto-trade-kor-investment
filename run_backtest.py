@@ -78,6 +78,10 @@ def parse_args():
                         help="캐시 무시하고 API에서 데이터 재수집")
     parser.add_argument("--label", type=str, default="",
                         help="리포트 파일명 접두어 (기본: 타임스탬프)")
+    parser.add_argument("--regime", type=str, default=None,
+                        choices=["BULL", "NORMAL", "BEAR", "VOLATILE",
+                                 "VOLATILE_UP", "VOLATILE_DOWN"],
+                        help="시뮬레이션할 시장 체제 고정 (기본: 없음 = config.yaml 기본값 사용)")
     return parser.parse_args()
 
 
@@ -147,7 +151,8 @@ def main():
 
     logger.info(f"백테스팅 시작: {args.start} ~ {args.end} | 종목 {len(tickers)}개")
     logger.info(f"  자본: {args.capital:,}원 | 임계점수: {args.threshold} | "
-                f"수수료: {args.commission*100:.3f}% | 슬리피지: {args.slippage*100:.3f}%")
+                f"수수료: {args.commission*100:.3f}% | 슬리피지: {args.slippage*100:.3f}% | "
+                f"체제: {args.regime or '기본값'}")
 
     # ── 1. 데이터 수집 ─────────────────────────────────────────────────
     if args.sample:
@@ -169,6 +174,7 @@ def main():
         commission=args.commission,
         slippage=args.slippage,
         score_threshold=args.threshold,
+        market_regime=args.regime,
     )
 
     # ── 3. 엔진 실행 ────────────────────────────────────────────────────
