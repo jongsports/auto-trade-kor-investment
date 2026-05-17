@@ -17,7 +17,13 @@ services:
 
     volumes:
       - /home/jongseung/kor-trade-data/logs:/app/logs
-      - /home/jongseung/kor-trade-data/data:/app/data
+      - /home/jongseung/kor-trade-data/data/token.json:/app/data/token.json
+      - /home/jongseung/kor-trade-data/data/backtest_cache:/app/data/backtest_cache
+      - /home/jongseung/kor-trade-data/data/screening_results.json:/app/data/screening_results.json
+      - /home/jongseung/kor-trade-data/data/foreign_streak.json:/app/data/foreign_streak.json
+      - /home/jongseung/kor-trade-data/data/strategy_performance.json:/app/data/strategy_performance.json
+      - /home/jongseung/kor-trade-data/data/strategy_stats.json:/app/data/strategy_stats.json
+      - /home/jongseung/kor-trade-data/data/holidays.json:/app/data/holidays.json
 
     command: python main.py
 
@@ -52,7 +58,13 @@ services:
 
     volumes:
       - /home/jongseung/kor-trade-data/logs:/app/logs
-      - /home/jongseung/kor-trade-data/data:/app/data
+      - /home/jongseung/kor-trade-data/data/token.json:/app/data/token.json
+      - /home/jongseung/kor-trade-data/data/backtest_cache:/app/data/backtest_cache
+      - /home/jongseung/kor-trade-data/data/screening_results.json:/app/data/screening_results.json
+      - /home/jongseung/kor-trade-data/data/foreign_streak.json:/app/data/foreign_streak.json
+      - /home/jongseung/kor-trade-data/data/strategy_performance.json:/app/data/strategy_performance.json
+      - /home/jongseung/kor-trade-data/data/strategy_stats.json:/app/data/strategy_stats.json
+      - /home/jongseung/kor-trade-data/data/holidays.json:/app/data/holidays.json
 
     command: python main.py --demo
 

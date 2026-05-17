@@ -69,11 +69,17 @@ jobs:
           printf "DB_PASSWORD=%s\n" "${{ secrets.DB_PASSWORD }}" >> .env
           echo "✅ .env 생성 완료 ($(grep -c '=' .env)개 항목)"
 
-      - name: 영구 데이터 디렉터리 생성
+      - name: 영구 데이터 디렉터리 및 파일 생성
         run: |
           mkdir -p /home/jongseung/kor-trade-data/logs
-          mkdir -p /home/jongseung/kor-trade-data/data
-          echo "✅ 데이터 디렉터리 준비 완료"
+          mkdir -p /home/jongseung/kor-trade-data/data/backtest_cache
+          touch /home/jongseung/kor-trade-data/data/token.json
+          touch /home/jongseung/kor-trade-data/data/screening_results.json
+          touch /home/jongseung/kor-trade-data/data/foreign_streak.json
+          touch /home/jongseung/kor-trade-data/data/strategy_performance.json
+          touch /home/jongseung/kor-trade-data/data/strategy_stats.json
+          touch /home/jongseung/kor-trade-data/data/holidays.json
+          echo "✅ 데이터 디렉터리/파일 준비 완료"
 
       - name: Docker 이미지 빌드
         run: docker compose build
