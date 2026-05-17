@@ -364,7 +364,7 @@ class AsyncStockScreener:
         오버나이트 창은 낮은 임계값이지만 수급(order_flow) 필수 조건이 별도 부과됨.
         """
         if is_overnight_window:
-            return 45
+            return 65  # 승률 18% → 조건 대폭 강화 (기존 45)
 
         now_str = datetime.now().strftime("%H:%M")
 
@@ -493,7 +493,7 @@ class AsyncStockScreener:
             total_raw = technical_score + volume_score + order_flow_score + news_pts
             total = int(total_raw * config.INTRADAY_MOMENTUM_WEIGHT) + intraday_bonus
         else:
-            # ── OVERNIGHT WINDOW 특수 로직 ────────────────────────────────────
+            # ── OVERNIGHT WINDOW 특수 로직 (강화: 승률 18%→개선 목표) ──────────
             if is_overnight_window and len(df) > 0:
                 current     = df.iloc[-1]
                 candle_size = current["high"] - current["low"]
@@ -501,22 +501,22 @@ class AsyncStockScreener:
                 if candle_size > 0:
                     close_position = (current["close"] - current["low"]) / candle_size
 
-                    if close_position < 0.7:
-                        # 고가 부근에서 마감 안 함 → 오버나이트 부적격
+                    if close_position < 0.85:
+                        # 상위 15% 마감만 허용 (기존 0.7→0.85)
+                        technical_score = 0
+                        volume_score    = 0
+                    elif technical_score < 20:
+                        # 기술적 지표 최소 20점 필수
                         technical_score = 0
                         volume_score    = 0
                     else:
                         overnight_bonus = 15
-                        # 종가가 일봉 상위 20% + 거래량 급증 → 추가 보너스
-                        if close_position >= 0.8 and self.check_volume_surge(df):
+                        if close_position >= 0.9 and self.check_volume_surge(df):
                             overnight_bonus = 20
 
-                        # 오버나이트 필수 조건: 외국인 또는 기관 순매수
-                        # Issue #13: API 실패(data_available=False)는 확정 0과 구분
-                        # - 데이터 미수신: 오버나이트 허용 (보너스만 제외)
-                        # - 확정 순매도(both 0 + data_available=True): 실격
+                        # 외국인+기관 동시 순매수 필수 (기존: 한쪽만)
                         trend_data_ok = investor_trend.get("data_available", True)
-                        if order_flow_score == 0 and trend_data_ok:
+                        if order_flow_score < 30 and trend_data_ok:
                             technical_score = 0
                             volume_score    = 0
                             overnight_bonus = 0

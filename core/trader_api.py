@@ -569,6 +569,10 @@ class AsyncKisAPI:
             msg1 = res.get("msg1", "")
             msg_cd = res.get("msg_cd", "")
             logger.error(f"[매도실패] {ticker} {quantity}주 | msg_cd={msg_cd} | {msg1}")
+            # 거래정지/매매불가 에러 표시 (재시도 방지용)
+            unsellable_codes = {"APBK0066", "APBK0919", "APBK0033"}
+            if msg_cd in unsellable_codes or "거래정지" in msg1 or "매매불가" in msg1:
+                res["_unsellable"] = True
         return res
         
     async def get_investor_trend(self, ticker: str, market_code: str = "J") -> Dict[str, Any]:

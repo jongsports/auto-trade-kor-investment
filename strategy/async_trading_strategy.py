@@ -21,6 +21,7 @@ class AsyncTradingStrategy:
         self.pending_orders = {}
         self._selling_tickers: set = set()   # Issue #20: 매도 진행 중 종목 (중복 주문 방지)
         self._recently_sold: dict = {}        # Issue #21: 최근 매도 {ticker: unix_ts} (30분 쿨다운)
+        self._unsellable_tickers: set = set() # 거래정지/매매불가 종목 (세션 내 재시도 차단)
         self._holdings_lock = asyncio.Lock()  # Holdings 동시 접근 방지
 
         self.take_profit_ratio = config.TAKE_PROFIT_RATIO
@@ -316,6 +317,14 @@ class AsyncTradingStrategy:
             logger.warning(f"[매도거부] {ticker}: 미보유 종목")
             return None
 
+        # Issue #20: 매도 진행 중 중복 주문 방지
+        if ticker in self._selling_tickers:
+            return None
+
+        # 거래정지/매매불가 종목 재시도 차단
+        if ticker in self._unsellable_tickers:
+            return None
+
         held_qty = self.holdings[ticker].get("quantity", 0)
         if held_qty <= 0:
             logger.warning(f"[매도거부] {ticker}: 보유수량 0")
@@ -328,22 +337,30 @@ class AsyncTradingStrategy:
             logger.warning(f"[매도거부] {ticker}: {msg}")
             return None
 
-        logger.info(f"[매도시도] {ticker} {sell_qty}주 (reason={reason})")
-        result = await self.api_client.market_sell(ticker, sell_qty)
+        self._selling_tickers.add(ticker)
+        try:
+            logger.info(f"[매도시도] {ticker} {sell_qty}주 (reason={reason})")
+            result = await self.api_client.market_sell(ticker, sell_qty)
 
-        if result.get("rt_cd") == "0":
-            price_data = await self.api_client.get_current_price(ticker)
-            current_price = price_data["price"] if price_data else 0
-            buy_price = self.holdings[ticker].get("buy_price", 0)
-            profit_ratio = (current_price / buy_price - 1) if buy_price > 0 and current_price else 0
-            self.order_history.append({
-                "action": "SELL",
-                "ticker": ticker,
-                "quantity": sell_qty,
-                "price": current_price or 0,
-                "time": datetime.now().isoformat(),
-                "reason": reason,
-                "profit_ratio": profit_ratio,
-            })
-            del self.holdings[ticker]
+            if result.get("rt_cd") == "0":
+                price_data = await self.api_client.get_current_price(ticker)
+                current_price = price_data["price"] if price_data else 0
+                buy_price = self.holdings[ticker].get("buy_price", 0)
+                profit_ratio = (current_price / buy_price - 1) if buy_price > 0 and current_price else 0
+                self.order_history.append({
+                    "action": "SELL",
+                    "ticker": ticker,
+                    "quantity": sell_qty,
+                    "price": current_price or 0,
+                    "time": datetime.now().isoformat(),
+                    "reason": reason,
+                    "profit_ratio": profit_ratio,
+                })
+                del self.holdings[ticker]
+                self._recently_sold[ticker] = datetime.now().timestamp()
+            elif result.get("_unsellable"):
+                self._unsellable_tickers.add(ticker)
+                logger.warning(f"[매도차단] {ticker}: 거래정지/매매불가 — 더 이상 재시도하지 않음")
+        finally:
+            self._selling_tickers.discard(ticker)
         return result
