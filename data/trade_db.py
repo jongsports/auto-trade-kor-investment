@@ -29,11 +29,11 @@ logger = logging.getLogger("auto_trade.trade_db")
 # DB 접속 정보 (환경변수 → 하드코딩 폴백)
 import os as _os
 DB_CONFIG = {
-    "host": _os.getenv("DB_HOST", "192.168.45.53"),
-    "port": int(_os.getenv("DB_PORT", "5432")),
-    "database": _os.getenv("DB_NAME", "auto_trade_kor"),
-    "user": _os.getenv("DB_USER", "trader"),
-    "password": _os.getenv("DB_PASSWORD", "trader2024"),
+    "host": _os.getenv("DB_HOST") or "192.168.45.53",
+    "port": int(_os.getenv("DB_PORT") or "5432"),
+    "database": _os.getenv("DB_NAME") or "auto_trade_kor",
+    "user": _os.getenv("DB_USER") or "trader",
+    "password": _os.getenv("DB_PASSWORD") or "trader2024",
 }
 
 
