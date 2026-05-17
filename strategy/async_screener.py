@@ -422,7 +422,8 @@ class AsyncStockScreener:
         technical_score  = 0   # max 40
         volume_score     = 0   # max 20
         order_flow_score = 0   # max 30
-        news_pts         = max(-5, min(10, int(news_score)))   # S1: 부정 뉴스 패널티
+        # 비대칭 가중 (2026-05-17): 부정 뉴스가 가격에 더 큰 영향 → -10 ~ +5
+        news_pts         = max(-10, min(5, int(news_score)))
         overnight_bonus  = 0
         intraday_bonus   = 0
 
@@ -635,11 +636,16 @@ class AsyncStockScreener:
 
             # 6. 세션별 임계값 필터
             threshold = self.get_entry_threshold(is_overnight_window)
-            # Bug fix (2026-04-24): 수급 API 실패 시 (09:30 이전 시간대 또는 KIS 이슈)
-            # 수급 30점이 항상 0점 → 스코어 상한 70점 → 임계값 55 미달 구조 문제.
-            # data_available=False일 때 임계값을 0.75배로 완화 (55→41) — 수급 없이도 후보 선정 가능.
-            if not investor_trend.get("data_available", True):
-                threshold = max(1, int(threshold * 0.75))
+            # 수급 데이터 미수신 처리 (2026-05-17 강화):
+            # 기존: 임계값 0.75배 완화 → confluence 사상 무너짐 (수급 0인데 통과)
+            # 변경: 인트라데이는 차단, 오버나이트는 임계값 0.85배 완화 (보수적)
+            supply_missing = not investor_trend.get("data_available", True)
+            if supply_missing:
+                if is_overnight_window:
+                    threshold = max(1, int(threshold * 0.85))  # 오버나이트는 약간 완화
+                else:
+                    # 인트라데이는 수급 없이 진입 차단 (가짜 신호 방지)
+                    return {}
             if total_score < threshold:
                 return {}
 

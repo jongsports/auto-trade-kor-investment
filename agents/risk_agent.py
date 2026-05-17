@@ -51,6 +51,7 @@ class RiskLimits:
     MAX_SINGLE_POSITION = 0.20        # 단일 종목 최대 20%
     MAX_TOTAL_EXPOSURE  = 0.70        # 총 노출 최대 70%
     MAX_SECTOR_EXPOSURE = 0.35        # 동일 섹터 최대 35%
+    MAX_SECTOR_COUNT = 2              # 동일 섹터 최대 보유 종목 수 (3종목 중 2개까지)
 
     # Kelly Criterion
     KELLY_FRACTION = 0.35             # Full Kelly의 35% 사용 (수수료 대비 수익성 확보)
@@ -266,12 +267,19 @@ class RiskManagementAgent(BaseAgent):
             if exposure >= RL.MAX_TOTAL_EXPOSURE:
                 return False, f"총 포지션 노출 한도 초과 ({exposure:.1%})"
 
-        # G1. 섹터 집중도 체크 (동일 섹터 최대 35%)
+        # G1. 섹터 집중도 체크 (금액 35% AND 종목 수 2개)
         if sector and ticker_sectors and self._total_equity > 0:
+            same_sector_holdings = [
+                (t, h) for t, h in current_holdings.items()
+                if ticker_sectors.get(t) == sector
+            ]
+            # 종목 수 cap (소형 포지션이라도 같은 섹터 쏠림 방지)
+            if len(same_sector_holdings) >= RL.MAX_SECTOR_COUNT:
+                return False, f"섹터({sector}) 보유 종목 수 한도 ({len(same_sector_holdings)}/{RL.MAX_SECTOR_COUNT})"
+            # 금액 cap (대형 포지션 시 발동)
             sector_invested = sum(
                 h.get("buy_price", 0) * h.get("quantity", 0)
-                for t, h in current_holdings.items()
-                if ticker_sectors.get(t) == sector
+                for _, h in same_sector_holdings
             )
             sector_exposure = sector_invested / self._total_equity
             if sector_exposure >= RL.MAX_SECTOR_EXPOSURE:
@@ -323,6 +331,13 @@ class RiskManagementAgent(BaseAgent):
             if win_rate >= RL.MIN_WIN_RATE:
                 edge = win_rate * avg_return - (1 - win_rate) * avg_loss
                 kelly = edge / (avg_return + 1e-9)
+                # 🛡️ 음수 edge 게이트: edge ≤ 0이면 베팅 금지 (이전 버그: max(0.07)이 음수를 7%로 끌어올림)
+                if kelly <= 0:
+                    logger.info(
+                        f"[Kelly-VETO] {strategy}: edge={edge:.4f} kelly={kelly:.3f} → 진입 차단 "
+                        f"(win_rate={win_rate:.2%}, avg_win={avg_return:.2%}, avg_loss={avg_loss:.2%})"
+                    )
+                    return 0  # 수량 0 반환 → coordinator에서 진입 신호 폐기
                 # win_rate별 Kelly fraction 스케일링
                 if win_rate < 0.55:
                     kelly_fraction = kelly * 0.20
