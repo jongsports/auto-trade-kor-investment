@@ -161,7 +161,9 @@ class RiskManagementAgent(BaseAgent):
         try:
             if os.path.exists(self._strategy_stats_file):
                 with open(self._strategy_stats_file, "r") as f:
-                    return json.load(f)
+                    content = f.read().strip()
+                    if content:
+                        return json.loads(content)
         except Exception as e:
             logger.warning(f"strategy_stats 로드 실패: {e}")
         return {}

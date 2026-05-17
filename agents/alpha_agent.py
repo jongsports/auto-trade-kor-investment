@@ -86,7 +86,9 @@ class AlphaGenerationAgent(BaseAgent):
         try:
             if os.path.exists(self._foreign_streak_file):
                 with open(self._foreign_streak_file, "r") as f:
-                    return json.load(f)
+                    content = f.read().strip()
+                    if content:
+                        return json.loads(content)
         except Exception as e:
             logger.warning(f"[AlphaGen] foreign_streak 로드 실패: {e}")
         return {}

@@ -113,7 +113,10 @@ class AsyncKisAPI:
             
         try:
             with open(self.token_file, "r") as f:
-                token_info = json.load(f)
+                content = f.read().strip()
+            if not content:
+                return False
+            token_info = json.loads(content)
             self.access_token = token_info["access_token"]
             expire_time = datetime.strptime(token_info["expire_time"], "%Y-%m-%d %H:%M:%S")
             

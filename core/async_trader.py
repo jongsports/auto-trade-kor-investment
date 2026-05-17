@@ -1114,7 +1114,10 @@ class AsyncAutoTrader:
             if not os.path.exists(config.SCREENING_RESULTS_FILE):
                 return
             with open(config.SCREENING_RESULTS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                content = f.read().strip()
+            if not content:
+                return
+            data = json.loads(content)
             saved_date = data.get("date", "")
             today = datetime.now().strftime("%Y-%m-%d")
             if saved_date == today and data.get("candidates"):
