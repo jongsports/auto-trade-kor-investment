@@ -40,8 +40,10 @@ def load_from_json(filename):
     """
     try:
         with open(filename, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data
+            content = f.read().strip()
+        if not content:
+            return None   # 빈 파일은 조용히 None 반환 (touch로 생성된 마운트 파일 대응)
+        return json.loads(content)
     except Exception as e:
         logger.error(f"JSON 로드 중 오류 발생: {str(e)}")
         return None
