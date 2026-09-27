@@ -27,6 +27,7 @@ def make_trader(holdings=None, coordinator=None):
     t.coordinator = coordinator
     t.candidate_stocks = []
     t._exit_fail_counts = {}
+    t._exit_retry_at = {}
     t._open_day_query_at = None
     t._trading_halted_on = ""
     t._restart_alerts = {}
@@ -44,6 +45,7 @@ def make_trader(holdings=None, coordinator=None):
     st.holdings = dict(holdings or {})
     st._unsellable_tickers = set()
     st.adopted_unknown = []
+    st.closed_positions = []
     st.order_history = []
     st.update_holdings = AsyncMock(return_value=True)
     st.open_tickers = lambda: [k for k, v in st.holdings.items()
@@ -57,10 +59,15 @@ def make_trader(holdings=None, coordinator=None):
 
 def accept_sell(st, price=63_000, qty=2):
     async def _exit(ticker, reason=""):
-        st.order_history.append({"action": "SELL", "ticker": ticker, "price": price, "quantity": qty})
-        st.holdings[ticker]["pending_sell"] = {"at": datetime.now().isoformat()}
+        st.holdings[ticker]["pending_sell"] = {
+            "at": datetime.now().isoformat(), "reason": reason, "quantity": qty, "price": price}
         return {"rt_cd": "0"}
     st.exit = AsyncMock(side_effect=_exit)
+
+
+def broker_confirms_close(st, ticker):
+    """다음 잔고 동기화에서 포지션이 사라진 것이 확인된 상황."""
+    st.closed_positions.append(st.holdings.pop(ticker))
 
 
 class ExitFlowTest(IsolatedStateTestCase):
@@ -71,16 +78,44 @@ class ExitFlowTest(IsolatedStateTestCase):
         st.update_holdings.assert_awaited_once()
         st.check_exit_condition.assert_not_awaited()
 
-    def test_accepted_sell_is_recorded_with_pnl_and_buy_link(self):
+    def test_accepted_sell_records_nothing_until_broker_confirms(self):
         t, st = make_trader({"005930": holding()})
         accept_sell(st)
         run(t._check_exit_conditions())
+        t.risk_manager.record_trade_pnl.assert_not_called()
+        t.db.save_trade_sell.assert_not_awaited()
+        self.assertIn("청산 주문 접수", t.notifier.send_message.await_args.args[0])
+
+    def test_confirmed_close_is_recorded_once_with_pnl_and_buy_link(self):
+        t, st = make_trader({"005930": holding()})
+        accept_sell(st)
+        run(t._check_exit_conditions())
+        broker_confirms_close(st, "005930")
+        run(t._check_exit_conditions())
+        run(t._check_exit_conditions())
+
         amount, ratio = net_pnl(70_000, 63_000, 2)
         self.assertLess(amount, -14_000)   # 수수료·거래세만큼 더 손실
         t.risk_manager.record_trade_pnl.assert_called_once_with(amount)
+        t.db.save_trade_sell.assert_awaited_once()
         kw = t.db.save_trade_sell.await_args.kwargs
         self.assertEqual((kw["buy_trade_id"], kw["strategy"], kw["quantity"]), (6, "Overnight", 2))
         self.assertAlmostEqual(kw["pnl_ratio"], ratio)
+        self.assertIn("Hard Stop", kw["reason"])
+        self.assertEqual(st.order_history[-1]["pnl_amount"], amount)
+
+    def test_released_order_then_resell_is_recorded_once(self):
+        # 접수된 주문이 체결 없이 풀렸다가 다시 매도되는 경우 손익이 두 번 잡히면 안 된다.
+        t, st = make_trader({"005930": holding()})
+        accept_sell(st)
+        run(t._check_exit_conditions())
+        st.holdings["005930"]["pending_sell"] = None      # 동기화가 주문이 풀린 것을 확인
+        run(t._check_exit_conditions())                   # 재매도 접수
+        broker_confirms_close(st, "005930")
+        run(t._check_exit_conditions())
+        self.assertEqual(st.exit.await_count, 2)
+        t.risk_manager.record_trade_pnl.assert_called_once()
+        t.db.save_trade_sell.assert_awaited_once()
 
     def test_pending_sell_is_not_signalled_again(self):
         t, st = make_trader({"005930": holding(pending_sell={"at": "x"})})
@@ -97,21 +132,52 @@ class ExitFlowTest(IsolatedStateTestCase):
         self.assertIn("출처 불명", t.notifier.send_message.await_args.args[0])
         self.assertEqual(st.adopted_unknown, [])
 
-    def test_three_failures_block_retries_but_keep_the_position(self):
+    def test_rejected_sell_keeps_retrying_with_growing_interval(self):
         t, st = make_trader({"005930": holding()})
         st.exit = AsyncMock(return_value={"rt_cd": "1", "msg_cd": "APBK0400", "msg1": "수량 초과"})
-        for _ in range(3):
-            run(t._check_exit_conditions())
-        self.assertIn("005930", st.holdings)             # 로컬에서 지우지 않는다
-        self.assertIn("005930", st._unsellable_tickers)
         run(t._check_exit_conditions())
-        self.assertEqual(st.exit.await_count, 3)
+        self.assertEqual(st.exit.await_count, 1)
+        run(t._check_exit_conditions())                   # 재시도 시각 전 → 건너뜀
+        self.assertEqual(st.exit.await_count, 1)
+
+        for expected in (2, 3, 4):
+            t._exit_retry_at["005930"] = datetime.now() - timedelta(seconds=1)
+            run(t._check_exit_conditions())
+            self.assertEqual(st.exit.await_count, expected)
+        self.assertIn("005930", st.holdings)
+        self.assertNotIn("005930", st._unsellable_tickers)   # 손절을 포기하지 않는다
+        delay = (t._exit_retry_at["005930"] - datetime.now()).total_seconds()
+        self.assertTrue(70 < delay <= 80, delay)              # 10 → 20 → 40 → 80초
         alerts = [c.args[0] for c in t.notifier.send_message.await_args_list]
-        self.assertEqual(sum("청산 실패" in a for a in alerts), 1)
+        self.assertEqual(sum("청산 실패 3회" in a for a in alerts), 1)
+
+    def test_transport_failure_is_not_counted_as_rejection(self):
+        # 서킷브레이커가 열린 60초 동안의 실패는 주문이 KIS 에 닿지도 않은 것이다.
+        t, st = make_trader({"005930": holding()})
+        st.exit = AsyncMock(return_value={"rt_cd": "-1", "msg1": "Circuit breaker open",
+                                          "_transport_failure": True})
+        for _ in range(6):
+            run(t._check_exit_conditions())
+        self.assertEqual(st.exit.await_count, 6)
+        self.assertEqual(t._exit_fail_counts, {})
+        self.assertEqual(st.open_tickers(), ["005930"])
+
+        accept_sell(st)                                   # 서킷이 닫히면 바로 나간다
+        run(t._check_exit_conditions())
+        self.assertIsNotNone(st.holdings["005930"]["pending_sell"])
+
+    def test_trading_halt_reported_by_broker_is_announced(self):
+        t, st = make_trader({"005930": holding()})
+        st.exit = AsyncMock(return_value={"rt_cd": "1", "msg_cd": "APBK0066", "msg1": "거래정지",
+                                          "_unsellable": True})
+        run(t._check_exit_conditions())
+        self.assertIn("매도 불가", t.notifier.send_message.await_args.args[0])
+        self.assertEqual(t._exit_fail_counts, {})
 
     def test_unconfirmed_sell_raises_alert(self):
         t, st = make_trader({"005930": holding()})
-        st.exit = AsyncMock(return_value={"rt_cd": "-1", "_unconfirmed": True})
+        st.exit = AsyncMock(return_value={"rt_cd": "-1", "_unconfirmed": True,
+                                          "_transport_failure": True})
         run(t._check_exit_conditions())
         self.assertIn("접수 여부 미확인", t.notifier.send_message.await_args.args[0])
         t.db.save_trade_sell.assert_not_awaited()
@@ -133,9 +199,17 @@ class MarketClosedRejectionTest(IsolatedStateTestCase):
         self.assertEqual(t._trading_halted_on, datetime.now().strftime("%Y%m%d"))
         self.assertFalse(run(t._is_open_today(datetime.now())))
 
-    def test_unverifiable_halts_the_day(self):
-        t, _ = self._reject(None)
-        self.assertTrue(t._trading_halted_on)
+    def test_unverifiable_does_not_halt(self):
+        # 휴장일조회가 실패했다는 이유만으로 손절 감시를 끄지 않는다.
+        t, st = self._reject(None)
+        self.assertEqual(t._trading_halted_on, "")
+        self.assertEqual(t._exit_fail_counts["005930"], 1)
+
+    def test_query_failure_falls_back_to_morning_confirmation(self):
+        market_calendar.register_open_days({datetime.now().strftime("%Y%m%d"): True})
+        t, st = self._reject(None)
+        self.assertEqual(t._trading_halted_on, "")
+        self.assertTrue(run(t._is_open_today(datetime.now().replace(hour=13))))
 
     def test_confirmed_open_day_keeps_monitoring(self):
         # 개장일에 난 APBK0919 하나로 그날 손절 감시까지 멈추면 안 된다.
@@ -151,6 +225,12 @@ class MarketClosedRejectionTest(IsolatedStateTestCase):
         self.assertEqual(st.exit.await_count, 1)
         self.assertEqual(sum("당일 매매 중단" in c.args[0]
                              for c in t.notifier.send_message.await_args_list), 1)
+
+    def test_halt_is_lifted_the_next_day(self):
+        t, st = self._reject(False)
+        tomorrow = datetime.now() + timedelta(days=1)
+        market_calendar.register_open_days({tomorrow.strftime("%Y%m%d"): True})
+        self.assertTrue(run(t._is_open_today(tomorrow.replace(hour=9))))
 
 
 class OpenDayTest(IsolatedStateTestCase):

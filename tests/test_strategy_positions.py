@@ -93,12 +93,45 @@ class ReconcileTest(IsolatedStateTestCase):
         run(s.update_holdings())   # 체결이 아직 잔고에 안 잡힘
         self.assertIn("005930", s.holdings)
 
-    def test_stale_local_position_missing_at_broker_is_dropped(self):
-        s, _, _ = make_strategy(account())
+    def test_position_sold_outside_the_bot_is_dropped(self):
+        s, api, _ = make_strategy(account(broker_pos()))
+        run(s.update_holdings())
+        s.holdings["005930"]["entry_time"] = datetime.now() - timedelta(days=3)
+        api.get_account_summary = AsyncMock(return_value=account())
+        run(s.update_holdings())
+        self.assertNotIn("005930", s.holdings)
+        self.assertEqual(s.closed_positions, [])          # 봇이 판 것이 아니므로 손익 기록 없음
+
+    def test_buy_never_seen_at_broker_is_remembered_and_blocks_rebuy(self):
+        s, api, _ = make_strategy(account())
         run(s.entry("005930", reason="Overnight"))
         s.holdings["005930"]["entry_time"] = datetime.now() - timedelta(minutes=5)
         run(s.update_holdings())
         self.assertNotIn("005930", s.holdings)
+        self.assertTrue(run(s.entry("005930", reason="Overnight"))["_rejected"])
+        self.assertEqual(api.market_buy.await_count, 1)
+
+        api.get_account_summary = AsyncMock(return_value=account(broker_pos(qty=3)))
+        run(s.update_holdings())                          # 늦게 체결
+        self.assertEqual(s.holdings["005930"]["reason"], "Overnight")
+        self.assertEqual(s.adopted_unknown, [])
+
+    def test_unfilled_entry_survives_restart_and_clears_next_day(self):
+        s, _, _ = make_strategy(account())
+        run(s.entry("005930", reason="Overnight"))
+        s.holdings["005930"]["entry_time"] = datetime.now() - timedelta(minutes=5)
+        run(s.update_holdings())
+        restarted, _, _ = make_strategy(account())
+        self.assertTrue(run(restarted.entry("005930"))["_rejected"])
+        restarted.reset_daily()
+        self.assertFalse(run(restarted.entry("005930")).get("_rejected", False))
+
+    def test_numpy_values_do_not_break_persistence(self):
+        import numpy as np
+        s, _, _ = make_strategy(account(broker_pos(buy=np.float64(70_150.0), cur=np.int64(72_000))))
+        self.assertTrue(run(s.update_holdings()))
+        restarted, _, _ = make_strategy()
+        self.assertEqual(restarted.holdings["005930"]["buy_price"], 70_150.0)
 
 
 class SellLifecycleTest(IsolatedStateTestCase):
@@ -120,12 +153,17 @@ class SellLifecycleTest(IsolatedStateTestCase):
         self.assertEqual(api.market_sell.await_count, 1)   # 재매도 없음
         self.assertEqual(s.open_tickers(), [])
 
-    def test_position_is_removed_once_broker_no_longer_holds_it(self):
+    def test_position_is_closed_once_broker_no_longer_holds_it(self):
         s, api, _ = self._held()
-        run(s.exit("005930", reason="x"))
+        run(s.exit("005930", reason="Hard Stop"))
+        self.assertEqual(s.closed_positions, [])          # 접수만으로는 청산이 아니다
         api.get_account_summary = AsyncMock(return_value=account())
         run(s.update_holdings())
         self.assertNotIn("005930", s.holdings)
+        closed = s.closed_positions[0]
+        self.assertEqual(closed["pending_sell"]["reason"], "Hard Stop")
+        self.assertEqual(closed["pending_sell"]["price"], 71_000)
+        self.assertEqual(s.in_rebuy_cooldown("005930"), 0)
 
     def test_unfilled_order_released_by_broker_allows_retry(self):
         s, api, _ = self._held()
@@ -184,6 +222,13 @@ class EntryTest(IsolatedStateTestCase):
         s, api, _ = make_strategy()
         run(s.entry("005930", reason="Overnight"))
         api.market_buy.assert_awaited_once_with("005930", 3)
+
+    def test_risk_plan_is_told_about_positions_the_bot_already_knows(self):
+        s, api, rm = make_strategy()
+        run(s.entry("005930", reason="Overnight"))
+        run(s.entry("000660", reason="Overnight"))
+        local = rm.plan_buy.await_args.args[2]
+        self.assertEqual(local, {"005930": 71_000 * 3})
 
     def test_requested_quantity_is_only_an_upper_bound(self):
         s, api, _ = make_strategy()

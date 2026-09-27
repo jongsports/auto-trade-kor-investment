@@ -37,8 +37,12 @@ class FakeBroker(AsyncKisAPI):
         self.daily = {}              # ticker -> 완성된 일봉 list (오래된 → 최신)
         self.universe = []           # [(ticker, name)]
         self.orders = []
+        self.unfilled_buys = []
         self.fill_orders = fill_orders
         self.fail_balance = False
+        self.fail_chart = False
+        self.chart_calls = 0
+        self.fill_buys = True
 
     # -- 시나리오 구성 -----------------------------------------------------
     def add_stock(self, ticker, name, last_close, *, today, end="2026-09-25"):
@@ -69,7 +73,11 @@ class FakeBroker(AsyncKisAPI):
                    if params["FID_INPUT_ISCD"] == "0001" and lo <= self.prices[t]["price"] <= hi]
             return {"rt_cd": "0", "output": out}
         if tr_id == "FHKST03010100":
-            rows = self.daily[params["FID_INPUT_ISCD"]]
+            self.chart_calls += 1
+            if self.fail_chart:
+                return {"rt_cd": "-1", "msg1": "Max retries exceeded", "_transport_failure": True}
+            lo, hi = params["FID_INPUT_DATE_1"], params["FID_INPUT_DATE_2"]
+            rows = [r for r in self.daily[params["FID_INPUT_ISCD"]] if lo <= r["stck_bsop_date"] <= hi]
             return {"rt_cd": "0", "output2": list(reversed(rows[-100:]))}
         if tr_id == "FHKST01010400":
             return {"rt_cd": "0", "output": list(reversed(self.daily[params["FID_INPUT_ISCD"]][-30:]))}
@@ -108,6 +116,9 @@ class FakeBroker(AsyncKisAPI):
             if side == "BUY":
                 if price * qty > self.cash:
                     return {"rt_cd": "1", "msg_cd": "APBK0952", "msg1": "주문가능금액을 초과"}
+                if not self.fill_buys:            # 접수만 되고 잔고에는 아직 안 잡힘
+                    self.unfilled_buys.append((ticker, qty, price))
+                    return {"rt_cd": "0", "output": {"ODNO": f"{len(self.orders):010d}"}}
                 self.cash -= price * qty
                 pos = self.positions.setdefault(ticker, {"qty": 0, "avg": 0.0, "working_sell": 0})
                 pos["avg"] = (pos["avg"] * pos["qty"] + price * qty) / (pos["qty"] + qty)
@@ -125,6 +136,14 @@ class FakeBroker(AsyncKisAPI):
                     pos["working_sell"] += qty      # 동시호가: 접수만 되고 미체결
             return {"rt_cd": "0", "output": {"ODNO": f"{len(self.orders):010d}"}}
         raise AssertionError(f"처리하지 않은 TR: {tr_id}")
+
+    def fill_unfilled_buys(self):
+        for ticker, qty, price in self.unfilled_buys:
+            self.cash -= price * qty
+            pos = self.positions.setdefault(ticker, {"qty": 0, "avg": 0.0, "working_sell": 0})
+            pos["avg"] = (pos["avg"] * pos["qty"] + price * qty) / (pos["qty"] + qty)
+            pos["qty"] += qty
+        self.unfilled_buys = []
 
     def fill_working_sells(self):
         for t in list(self.positions):
@@ -156,6 +175,7 @@ def build_trader(broker):
     t.coordinator = None
     t.candidate_stocks = []
     t._exit_fail_counts = {}
+    t._exit_retry_at = {}
     t._open_day_query_at = None
     t._trading_halted_on = ""
     t._restart_alerts = {}
@@ -241,6 +261,7 @@ class OvernightRoundTripTest(IsolatedStateTestCase):
             realized = restarted.risk_manager.daily_realized_pnl()
         sells = [o for o in broker.orders if o[0] == "SELL" and o[1] == ticker]
         self.assertEqual(len(sells), 1)
+        restarted.db.save_trade_sell.assert_awaited_once()
         self.assertNotIn(ticker, restarted.strategy.holdings)
         kw = restarted.db.save_trade_sell.await_args.kwargs
         self.assertEqual(kw["buy_trade_id"], info["buy_trade_id"])
@@ -263,6 +284,7 @@ class OvernightRoundTripTest(IsolatedStateTestCase):
         broker.set_price(ticker, round(broker.positions[ticker]["avg"] * 0.95))
         with at(datetime(2026, 9, 29, 9, 30)):
             run(restarted._check_exit_conditions())
+            run(restarted._check_exit_conditions())     # 다음 틱: 체결 확인
             realized = restarted.risk_manager.daily_realized_pnl()
         kw = restarted.db.save_trade_sell.await_args.kwargs
         self.assertIn("Hard Stop", kw["reason"])
@@ -280,10 +302,13 @@ class OvernightRoundTripTest(IsolatedStateTestCase):
         self.assertEqual(sells, [("SELL", "000100", 5)])
         self.assertFalse(any("청산 실패" in a or "청산 이상" in a for a in alerts(trader)))
 
+        trader.db.save_trade_sell.assert_not_awaited()   # 체결 전에는 손익을 기록하지 않는다
+
         broker.fill_working_sells()                      # 15:30 체결
         with at(datetime(2026, 9, 28, 15, 30, 10)):
             run(trader._check_exit_conditions())
         self.assertEqual(trader.strategy.holdings, {})
+        trader.db.save_trade_sell.assert_awaited_once()
 
     def test_balance_outage_blocks_buys_and_keeps_positions(self):
         broker = self._broker()
@@ -310,6 +335,56 @@ class OvernightRoundTripTest(IsolatedStateTestCase):
             run(trader._overnight_entry())
         self.assertEqual([o for o in broker.orders if o[0] == "BUY"], [])
         self.assertTrue(any("투자 비율 한도" in a for a in alerts(trader)), alerts(trader))
+
+    def test_orders_not_yet_at_broker_still_count_against_limits(self):
+        # 접수한 매수가 잔고에 늦게 잡혀도 같은 한도를 여러 번 쓰지 않는다.
+        broker = self._broker()
+        broker.fill_buys = False
+        trader = build_trader(broker)
+        with at(MON_1510):
+            run(trader._overnight_entry())
+        amount = sum(q * p for _, q, p in broker.unfilled_buys)
+        self.assertGreater(amount, 0)
+        self.assertLessEqual(amount, 1_300_000 * config.MAX_INVESTMENT_RATIO)
+        self.assertLessEqual(len(broker.unfilled_buys), config.MAX_STOCK_COUNT)
+
+    def test_late_fill_keeps_strategy_and_blocks_rebuy(self):
+        broker = self._broker()
+        broker.fill_buys = False
+        trader = build_trader(broker)
+        with at(MON_1510):
+            run(trader._overnight_entry())
+        bought = [t for t, _, _ in broker.unfilled_buys]
+        ticker = bought[0]
+
+        with at(datetime(2026, 9, 28, 15, 12)):          # 유예 60초 경과, 아직 미체결
+            run(trader._check_exit_conditions())
+            self.assertNotIn(ticker, trader.strategy.holdings)
+            n_orders = len(broker.orders)
+            run(trader._overnight_entry())               # 같은 종목 재매수 시도
+        self.assertNotIn(ticker, [t for _, t, _ in broker.orders[n_orders:]])
+
+        broker.fill_unfilled_buys()                      # 늦게 체결
+        with at(datetime(2026, 9, 28, 15, 15)):
+            run(trader._check_exit_conditions())
+        info = trader.strategy.holdings[ticker]
+        self.assertEqual(info["reason"], "Overnight")     # Standard 로 떨어지지 않는다
+        self.assertEqual([o for o in broker.orders if o[0] == "SELL"], [])
+
+    def test_failed_price_history_blocks_candidates(self):
+        broker = self._broker()
+        broker.fail_chart = True
+        trader = build_trader(broker)
+        with at(MON_1510):
+            run(trader._overnight_entry())
+        self.assertEqual(broker.orders, [])
+
+    def test_screening_uses_one_chart_call_per_ticker(self):
+        broker = self._broker()
+        trader = build_trader(broker)
+        with at(MON_1510):
+            run(trader.screener.run_screening_async(["KOSPI"]))
+        self.assertEqual(broker.chart_calls, 2)           # 가격 상한을 통과한 2종목
 
     def test_reports_do_not_crash(self):
         broker = self._broker()

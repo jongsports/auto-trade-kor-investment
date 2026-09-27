@@ -92,6 +92,33 @@ class PlanBuyTest(IsolatedStateTestCase):
         self.assertLessEqual(200_000 + p.quantity * 10_000, 260_000)
 
 
+    def test_orders_not_yet_at_broker_consume_limits(self):
+        acct = {"total_evaluated_amount": 1_300_000, "available_amount": 1_300_000, "positions": []}
+        rm, _ = make_rm(acct)
+        free = run(rm.plan_buy("C", 10_000)).quantity
+        self.assertGreater(free, 0)
+        # 방금 접수한 두 주문(합계 25만원)이 잔고에 아직 없다 → 한도 26만원 중 1만원 남음
+        p = run(rm.plan_buy("C", 10_000, {"A": 125_000.0, "B": 125_000.0}))
+        self.assertEqual(p.quantity, 1)
+        p = run(rm.plan_buy("D", 10_000, {"A": 80_000.0, "B": 80_000.0, "C": 80_000.0}))
+        self.assertEqual(p.quantity, 0)                  # 종목 수 한도
+
+    def test_positions_already_at_broker_are_not_double_counted(self):
+        acct = {"total_evaluated_amount": 1_300_000, "available_amount": 1_000_000,
+                "positions": [{"ticker": "A", "current_price": 100_000, "quantity": 1}]}
+        rm, _ = make_rm(acct)
+        with_local = run(rm.plan_buy("C", 10_000, {"A": 100_000.0})).quantity
+        without = run(rm.plan_buy("C", 10_000)).quantity
+        self.assertEqual(with_local, without)
+
+    def test_unreadable_market_data_downgrades_risk_state(self):
+        rm, api = make_rm({})
+        rm.risk_status, rm.market_condition = "NORMAL", "BULL"
+        api.get_ohlcv = AsyncMock(return_value=pd.DataFrame())
+        run(rm.assess_market_risk())
+        self.assertEqual((rm.risk_status, rm.market_condition), ("CAUTION", "NORMAL"))
+
+
 class CanTradeTest(IsolatedStateTestCase):
     def _rm(self, account, realized=0.0):
         rm, api = make_rm(account)

@@ -1,6 +1,7 @@
 """AsyncKisAPI 오프라인 테스트 — 네트워크 호출 없음."""
 import asyncio
 import unittest
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pandas as pd
@@ -79,6 +80,14 @@ class OrderResendTest(unittest.TestCase):
         self.assertEqual(api.session.calls, 2)
         self.assertEqual(res.get("rt_cd"), "0")
 
+    def test_circuit_breaker_failure_is_marked_as_not_a_broker_decision(self):
+        from datetime import timedelta
+        api = make_api()
+        api._cb_open_until = datetime.now() + timedelta(seconds=60)
+        res = run(api.market_sell("005930", 1))
+        self.assertTrue(res["_transport_failure"])
+        self.assertIsNone(res.get("_unsellable"))
+
     def test_order_is_resent_after_explicit_tps_rejection(self):
         api = make_api()
         api.session = FakeSession([{"msg_cd": "EGW00201"}, {"rt_cd": "0", "output": {"ODNO": "0001"}}])
@@ -117,6 +126,7 @@ class TokenRefreshTest(unittest.TestCase):
         api.session = FakeSession([{"msg_cd": "EGW00123"}] * 5)
         res = run(api._fetch("GET", "/x", "TR"))
         self.assertEqual(res.get("msg_cd"), "TOKEN_REFRESH_FAILED")
+        self.assertTrue(res["_transport_failure"])
         self.assertEqual(api._sync_init.call_count, 1)
 
 
@@ -198,6 +208,13 @@ class AccountSummaryTest(unittest.TestCase):
                                "cma_evlu_amt": "0", "tot_evlu_amt": "1000000"})
         self.assertEqual(s["available_amount"], 600000)
 
+    def test_spent_cash_is_not_replaced_by_pre_trade_deposit(self):
+        # 당일 매수로 D+2 예수금이 0 이하가 된 경우 — 매수 전 예수금을 쓰면 미수 주문이 된다.
+        for prvs in ("0", "-20000"):
+            s = self._summary([], {"dnca_tot_amt": "500000", "prvs_rcdl_excc_amt": prvs,
+                                   "cma_evlu_amt": "0", "tot_evlu_amt": "500000"})
+            self.assertEqual(s["available_amount"], 0, prvs)
+
     def test_cma_account_falls_back_to_cma_balance(self):
         s = self._summary([], {"dnca_tot_amt": "0", "prvs_rcdl_excc_amt": "0",
                                "cma_evlu_amt": "500000", "tot_evlu_amt": "500000"})
@@ -215,17 +232,52 @@ class AccountSummaryTest(unittest.TestCase):
         self.assertEqual(run(api.get_account_summary()), {})
 
 
+def chart_rows(end, periods):
+    return [{"stck_bsop_date": d.strftime("%Y%m%d"), "stck_oprc": "10", "stck_hgpr": "11",
+             "stck_lwpr": "9", "stck_clpr": "10", "acml_vol": "100", "acml_tr_pbmn": "1000"}
+            for d in pd.bdate_range(end=end, periods=periods)]
+
+
 class OhlcvTest(unittest.TestCase):
-    def test_long_window_uses_range_endpoint(self):
+    NOW = datetime(2026, 9, 28, 10, 0)
+
+    def _get(self, api, count):
+        class Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return OhlcvTest.NOW
+        with patch("core.trader_api.datetime", Frozen):
+            return run(api.get_ohlcv("005930", count=count))
+
+    def test_hundred_bars_take_a_single_range_call(self):
         api = make_api()
-        rows = [{"stck_bsop_date": d.strftime("%Y%m%d"), "stck_oprc": "10", "stck_hgpr": "11",
-                 "stck_lwpr": "9", "stck_clpr": "10", "acml_vol": "100", "acml_tr_pbmn": "1000"}
-                for d in pd.bdate_range("2026-05-01", periods=100)]
-        api._fetch = AsyncMock(return_value={"rt_cd": "0", "output2": rows})
-        df = run(api.get_ohlcv("005930", count=100))
+        api._fetch = AsyncMock(return_value={"rt_cd": "0", "output2": chart_rows("2026-09-25", 100)})
+        df = self._get(api, 100)
         self.assertEqual(len(df), 100)
-        self.assertEqual(api._fetch.await_args_list[0].args[2], "FHKST03010100")
+        self.assertEqual(api._fetch.await_count, 1)
+        self.assertEqual(api._fetch.await_args.args[2], "FHKST03010100")
         self.assertTrue(df["date"].is_monotonic_increasing)
+
+    def test_failed_call_returns_nothing_and_is_not_cached(self):
+        api = make_api()
+        api._fetch = AsyncMock(return_value={"rt_cd": "-1", "msg1": "Max retries exceeded"})
+        self.assertTrue(self._get(api, 100).empty)
+        self.assertEqual(api._ohlcv_cache, {})
+
+    def test_stale_history_is_rejected(self):
+        # 최근 구간 조회만 실패해 4개월 전 데이터가 온 경우
+        api = make_api()
+        api._fetch = AsyncMock(return_value={"rt_cd": "0", "output2": chart_rows("2026-05-08", 60)})
+        self.assertTrue(self._get(api, 100).empty)
+        self.assertEqual(api._ohlcv_cache, {})
+
+    def test_long_window_fails_as_a_whole_when_any_chunk_fails(self):
+        api = make_api()
+        api._fetch = AsyncMock(side_effect=[
+            {"rt_cd": "-1", "msg1": "Max retries exceeded"},
+            {"rt_cd": "0", "output2": chart_rows("2026-05-08", 60)},
+        ])
+        self.assertTrue(self._get(api, 120).empty)
 
     def test_short_window_keeps_single_cheap_call(self):
         api = make_api()

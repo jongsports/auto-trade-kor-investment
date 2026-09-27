@@ -92,5 +92,18 @@ class ConfigTest(unittest.TestCase):
         self.assertFalse(config.AGENTS_ENABLED)
 
 
+class MainEntrypointTest(unittest.TestCase):
+    def test_engine_crash_is_logged_and_propagated(self):
+        import logging
+        import main
+
+        trader = MagicMock()
+        trader.start = AsyncMock(side_effect=KeyError("boom"))
+        trader.stop = AsyncMock()
+        with self.assertLogs("main", level="CRITICAL"), self.assertRaises(KeyError):
+            run(main.run_until_signalled(trader, logging.getLogger("main")))
+        trader.stop.assert_not_awaited()
+
+
 if __name__ == "__main__":
     unittest.main()

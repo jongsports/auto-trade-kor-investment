@@ -121,8 +121,8 @@ jobs:
             docker logs --tail 80 kor-trade-live
             exit 1
           fi
-          if docker logs --since 45s kor-trade-live 2>&1 | grep -q "Traceback"; then
-            echo "❌ 기동 로그에 예외가 있습니다."
+          if docker logs --since 45s kor-trade-live 2>&1 | grep -q "엔진이 예외로 종료됨"; then
+            echo "❌ 엔진이 기동 중 예외로 종료됐습니다."
             docker logs --tail 80 kor-trade-live
             exit 1
           fi

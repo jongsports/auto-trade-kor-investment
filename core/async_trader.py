@@ -2,7 +2,7 @@ import logging
 import asyncio
 import json
 import os
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import Dict, Optional
 
 import config
@@ -56,6 +56,7 @@ class AsyncAutoTrader:
 
         # 청산 실패 연속 카운터 (ticker → 실패 횟수)
         self._exit_fail_counts: Dict[str, int] = {}
+        self._exit_retry_at: Dict[str, datetime] = {}         # 매도 거부 후 다음 시도 시각
         self._open_day_query_at: Optional[datetime] = None   # 마지막 KIS 개장일 조회 시각
         self._trading_halted_on: str = ""                     # 당일 매매 중단 결정 날짜
 
@@ -103,6 +104,13 @@ class AsyncAutoTrader:
         except Exception as e:
             logger.error(f"잔고 동기화 오류: {e}")
             return False
+        closed, self.strategy.closed_positions = self.strategy.closed_positions, []
+        for info in closed:
+            try:
+                await self._on_position_closed(info)
+            except Exception as e:
+                logger.error(f"청산 확정 기록 오류 {info.get('ticker')}: {e}", exc_info=True)
+
         adopted, self.strategy.adopted_unknown = self.strategy.adopted_unknown, []
         for ticker in adopted:
             info = self.strategy.holdings.get(ticker, {})
@@ -245,6 +253,7 @@ class AsyncAutoTrader:
         date_str = now.strftime("%Y%m%d")
         if self._trading_halted_on == date_str:
             return False
+        self._trading_halted_on = ""
 
         if not market_calendar.is_confirmed(now) and now.hour >= 6:
             due = (self._open_day_query_at is None
@@ -311,6 +320,7 @@ class AsyncAutoTrader:
                         self.coordinator.reset_daily(current_holdings=self.strategy.holdings)
                     self.strategy.reset_daily()
                     self._exit_fail_counts.clear()
+                    self._exit_retry_at.clear()
                 else:
                     logger.info("휴장일이므로 07:00 시장 리스크 평가를 건너뜁니다.")
 
@@ -421,22 +431,18 @@ class AsyncAutoTrader:
                 # 1. 청산 조건 체크
                 await self._check_exit_conditions()
 
-                # 1.1 CB Level 3/4 강제 청산 (P3: 누진적 서킷브레이커)
+                # 1.1 CB Level 3/4 강제 청산 (에이전트 활성 시)
                 if self.coordinator:
                     if self.coordinator.risk.should_close_all():
-                        for t in list(self.strategy.holdings.keys()):
+                        for t in self.strategy.open_tickers():
                             logger.critical(f"🚨 [CB4] 전 포지션 청산: {t}")
-                            await self.strategy.exit(t, reason="CB_LEVEL_4_CLOSE_ALL")
+                            await self._execute_exit(t, "CB_LEVEL_4_CLOSE_ALL")
                     elif self.coordinator.risk.should_force_close_losers():
-                        for t, info in list(self.strategy.holdings.items()):
-                            try:
-                                price_info = await self.api_client.get_current_price(t)
-                                cur = price_info.get("price", 0) if price_info else 0
-                            except Exception:
-                                cur = 0
-                            if cur > 0 and cur < info.get("buy_price", 0):
+                        for t in self.strategy.open_tickers():
+                            info = self.strategy.holdings[t]
+                            if 0 < info.get("current_price", 0) < info.get("buy_price", 0):
                                 logger.critical(f"🚨 [CB3] 손실 포지션 강제 청산: {t}")
-                                await self.strategy.exit(t, reason="CB_LEVEL_3_FORCE_CLOSE")
+                                await self._execute_exit(t, "CB_LEVEL_3_FORCE_CLOSE")
 
                 # 1.5. 하트비트 보고 (매 STATUS_REPORT_INTERVAL_MINUTES 분마다)
                 minutes_since_last = (now - self._last_heartbeat_time).total_seconds() / 60
@@ -1010,7 +1016,9 @@ class AsyncAutoTrader:
         # 여기서 잡지 못하면 손절 감시 없이 방치된다.
         await self._sync_holdings()
 
-        tickers = self.strategy.open_tickers()
+        now = datetime.now()
+        tickers = [t for t in self.strategy.open_tickers()
+                   if self._exit_retry_at.get(t, now) <= now]
         if not tickers:
             return
 
@@ -1032,52 +1040,68 @@ class AsyncAutoTrader:
                 should_exit, reason = await self.strategy.check_exit_condition(ticker, market_regime=regime)
                 if not should_exit and ticker in agent_sell_set:
                     should_exit, reason = True, "에이전트 리스크 청산"
-                if not should_exit:
-                    continue
-
-                holding = dict(self.strategy.holdings.get(ticker, {}))
-                logger.info(f"[청산신호] {ticker}: {reason}")
-                result = await self.strategy.exit(ticker, reason=reason)
-
-                if result is None:
-                    continue  # 매도 불가 시간·미체결 주문 대기 등 — 다음 틱에 다시 판단
-                if result.get("rt_cd") == "0":
-                    self._exit_fail_counts.pop(ticker, None)
-                    await self._on_sell_accepted(ticker, holding, reason, regime)
-                elif result.get("_unconfirmed"):
-                    await self.notifier.send_message(
-                        f"🚨 <b>매도 주문 접수 여부 미확인</b> {holding.get('name', ticker)} ({ticker})\n"
-                        f"주문 전송 후 응답을 받지 못했습니다. 재전송하지 않았습니다.\n"
-                        f"잔고에 매도가능수량이 남아 있으면 30초 뒤 다시 시도합니다."
-                    )
-                else:
-                    halted = await self._on_sell_failed(ticker, holding, result)
-                    if halted:
-                        return
+                if should_exit and await self._execute_exit(ticker, reason):
+                    return   # 당일 매매 중단
             except Exception as e:
                 logger.error(f"청산 조건 체크 오류 {ticker}: {e}", exc_info=True)
 
-    async def _on_sell_accepted(self, ticker: str, holding: dict, reason: str, regime: str):
-        """매도 주문 접수 후 기록·알림. 가격은 접수 시점 시세 기준의 추정치다."""
-        buy_price = holding.get("buy_price", 0)
-        sold = next((h for h in reversed(self.strategy.order_history)
-                     if h["action"] == "SELL" and h["ticker"] == ticker), {})
-        sell_price = sold.get("price") or holding.get("current_price", 0)
-        qty = sold.get("quantity") or holding.get("quantity", 0)
+    async def _execute_exit(self, ticker: str, reason: str) -> bool:
+        """매도 주문을 내고 결과를 처리한다. 당일 매매를 중단했으면 True."""
+        holding = dict(self.strategy.holdings.get(ticker, {}))
+        name = holding.get("name", ticker)
+        logger.info(f"[청산신호] {ticker}: {reason}")
+        result = await self.strategy.exit(ticker, reason=reason)
+
+        if result is None:
+            return False   # 매도 불가 시간·미체결 주문 대기 등 — 다음 틱에 다시 판단
+        if result.get("rt_cd") == "0":
+            self._exit_fail_counts.pop(ticker, None)
+            self._exit_retry_at.pop(ticker, None)
+            await self.notifier.send_message(
+                f"📤 <b>청산 주문 접수</b> {name} ({ticker})\n"
+                f"{holding.get('quantity', 0)}주 | 사유: {reason}\n"
+                f"체결이 확인되면 손익을 알립니다."
+            )
+            return False
+        if result.get("_unconfirmed"):
+            await self.notifier.send_message(
+                f"🚨 <b>매도 주문 접수 여부 미확인</b> {name} ({ticker})\n"
+                f"주문 전송 후 응답을 받지 못했습니다. 재전송하지 않았습니다.\n"
+                f"잔고에 매도가능수량이 남아 있으면 30초 뒤 다시 시도합니다."
+            )
+            return False
+        return await self._on_sell_failed(ticker, holding, result)
+
+    async def _on_position_closed(self, info: dict):
+        """잔고에서 사라진 것이 확인된 청산의 손익 기록·알림.
+
+        가격은 매도 접수 시점의 시세다 (체결조회를 하지 않으므로 추정치).
+        """
+        ticker = info["ticker"]
+        pending = info.get("pending_sell") or {}
+        buy_price = info.get("buy_price", 0)
+        sell_price = pending.get("price") or info.get("current_price", 0)
+        qty = pending.get("quantity") or info.get("quantity", 0)
+        reason = pending.get("reason", "")
+        stock_name = info.get("name", ticker)
+        strategy_name = info.get("reason", "Standard")
+        regime = self._get_current_market_regime()
+
         # 수수료·거래세를 뺀 값. 승패 판정과 일일 손실 한도가 이 값을 쓴다.
         pnl_amount, profit_pct = net_pnl(buy_price, sell_price, qty)
-        stock_name = holding.get("name", ticker)
-        strategy_name = holding.get("reason", "Standard")
 
-        hold_mins = int((datetime.now() - holding["entry_time"]).total_seconds() / 60) \
-            if holding.get("entry_time") else 0
+        hold_mins = int((datetime.now() - info["entry_time"]).total_seconds() / 60)
         hold_str = f"{hold_mins // 60}h{hold_mins % 60}m" if hold_mins >= 60 else f"{hold_mins}분"
 
-        # 일일 손실 한도가 이 값을 읽는다.
         self.risk_manager.record_trade_pnl(pnl_amount)
+        self.strategy.order_history.append({
+            "action": "SELL", "ticker": ticker, "name": stock_name, "quantity": qty,
+            "price": sell_price, "time": datetime.now().isoformat(), "reason": reason,
+            "strategy": strategy_name, "profit_ratio": profit_pct, "pnl_amount": pnl_amount,
+        })
 
         await self.notifier.send_message(
-            f"📤 <b>청산 주문 접수</b> {stock_name} ({ticker})\n"
+            f"✅ <b>청산 확정</b> {stock_name} ({ticker})\n"
             f"{'🟢' if profit_pct >= 0 else '🔴'} 수익률: <b>{profit_pct:+.2%}</b> | {qty}주 | 보유: {hold_str}\n"
             f"손익(비용 차감, 추정): {pnl_amount:+,.0f}원\n"
             f"매수가: {buy_price:,.0f}원 → 기준가: {sell_price:,.0f}원\n"
@@ -1102,48 +1126,62 @@ class AsyncAutoTrader:
             pnl_amount=float(pnl_amount),
             pnl_ratio=float(profit_pct),
             reason=reason,
-            buy_trade_id=holding.get("buy_trade_id"),
+            buy_trade_id=info.get("buy_trade_id"),
             market_regime=regime,
             strategy=strategy_name,
         )
 
     async def _on_sell_failed(self, ticker: str, holding: dict, result: dict) -> bool:
-        """매도 실패 처리. 당일 매매를 중단했으면 True."""
+        """매도 실패 처리. 당일 매매를 중단했으면 True.
+
+        손절은 포기하지 않는다. 종목 단위로 막는 것은 KIS 가 거래정지라고 답한 경우
+        (strategy 가 처리)뿐이고, 나머지는 간격을 늘려 가며 계속 시도한다.
+        """
         err_msg = result.get("msg1", "unknown")
         err_code = result.get("msg_cd", "")
         stock_name = holding.get("name", ticker)
         logger.error(f"[청산실패] {ticker}: {err_code} {err_msg}")
 
+        if result.get("_unsellable"):
+            await self.notifier.send_message(
+                f"🚨 <b>매도 불가</b> {stock_name} ({ticker})\n"
+                f"KIS 응답: {err_code} {err_msg}\n"
+                f"거래정지/매매불가로 보고 오늘은 재시도하지 않습니다. 내일 장 시작 전 다시 풀립니다."
+            )
+            return False
+
+        # 주문이 KIS 에 닿지 못한 실패(서킷 오픈, 재시도 소진, 토큰 갱신 실패)는 주문
+        # 거부가 아니다. 세지 않고 다음 틱에 다시 시도한다.
+        if result.get("_transport_failure"):
+            return False
+
         # APBK0919 = KIS 가 본 장운영일자가 주문일과 다르다 → 휴장일 의심.
-        # 주문 오류만으로 달력을 덮지 않고 휴장일조회로 확인한 뒤에만 중단한다.
-        # 개장일로 확인되면 일시적 오류로 보고 일반 실패로 처리한다 (손절 감시 유지).
+        # 주문 오류만으로 달력을 덮지 않고 휴장일조회로 확인한다.
         if err_code == "APBK0919":
             now = datetime.now()
             kis_open = await self._refresh_open_days(now)
-            if kis_open is not True:
+            if kis_open is None and market_calendar.is_confirmed(now):
+                kis_open = market_calendar.is_trading_day(now)   # 아침에 확인해 둔 값
+            if kis_open is False:
                 self._trading_halted_on = now.strftime("%Y%m%d")
-                confirmed = "휴장일로 확인됨" if kis_open is False else "휴장일조회 실패로 확인 불가"
-                logger.error(f"[개장일오류] APBK0919 수신, {confirmed} → 당일 매매 중단")
+                logger.error("[개장일오류] APBK0919 수신, 휴장일로 확인됨 → 당일 매매 중단")
                 await self.notifier.send_message(
                     f"🚨 <b>당일 매매 중단</b>\n"
                     f"{stock_name}({ticker}) 주문이 APBK0919(장운영일자 상이)로 거부됐고 "
-                    f"{confirmed}."
+                    f"휴장일로 확인됐습니다."
                 )
                 return True
+            # 개장일이거나 확인할 수 없으면 감시를 멈추지 않는다. 아래 재시도 간격만 적용.
 
         fail_cnt = self._exit_fail_counts.get(ticker, 0) + 1
         self._exit_fail_counts[ticker] = fail_cnt
-        if fail_cnt >= 3:
-            # 포지션을 로컬에서 지우지 않는다. 지워도 다음 동기화가 잔고에서 다시 넣고,
-            # 그때 메타데이터(전략·매수 시각)만 잃는다. 당일 재시도만 막고 알린다.
-            self.strategy._unsellable_tickers.add(ticker)
-            self._exit_fail_counts.pop(ticker, None)
-            logger.warning(f"[청산실패] {ticker} {fail_cnt}회 연속 실패 → 당일 매도 재시도 중단")
+        delay = min(10 * 2 ** (fail_cnt - 1), 300)
+        self._exit_retry_at[ticker] = datetime.now() + timedelta(seconds=delay)
+        if fail_cnt == 3 or fail_cnt % 20 == 0:
             await self.notifier.send_message(
-                f"🚨 <b>청산 실패</b> {stock_name} ({ticker})\n"
-                f"{fail_cnt}회 연속 실패로 오늘은 재시도하지 않습니다. 포지션은 그대로 남아 있습니다.\n"
+                f"🚨 <b>청산 실패 {fail_cnt}회</b> {stock_name} ({ticker})\n"
                 f"오류: {err_code} {err_msg}\n"
-                f"직접 확인이 필요합니다. 내일 장 시작 전 차단이 풀립니다."
+                f"{delay}초 간격으로 계속 시도합니다. 포지션은 그대로 남아 있습니다."
             )
         return False
 

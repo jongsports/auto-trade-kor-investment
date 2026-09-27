@@ -131,6 +131,19 @@ class ProcessTickerTest(IsolatedStateTestCase):
         for kw in ({}, {"is_intraday": True}, {"is_overnight_window": True}):
             self.assertEqual(run(s._process_ticker("000001", "KOSPI", **kw)), {})
 
+    def test_yesterdays_flow_does_not_qualify_intraday_or_overnight(self):
+        s, api = make_screener()
+        s.get_entry_threshold = lambda *_: 0
+        api.get_investor_trend = AsyncMock(return_value={
+            "foreign_net_buy": 5000, "institution_net_buy": 5000,
+            "source": "confirmed", "as_of": "20260925"})
+        with freeze_time("strategy.async_screener", datetime(2026, 9, 28, 15, 10)):
+            self.assertEqual(run(s._process_ticker("000001", "KOSPI", is_overnight_window=True)), {})
+            self.assertEqual(run(s._process_ticker("000001", "KOSPI", is_intraday=True)), {})
+        # 프리마켓은 전 거래일 확정치를 쓰는 것이 맞다
+        with freeze_time("strategy.async_screener", datetime(2026, 9, 28, 8, 0)):
+            self.assertEqual(run(s._process_ticker("000001", "KOSPI"))["ticker"], "000001")
+
     def test_quote_failure_blocks_intraday_candidate(self):
         s, api = make_screener()
         api.get_current_price = AsyncMock(return_value=None)

@@ -37,6 +37,12 @@ async def run_until_signalled(trader: AsyncAutoTrader, logger: logging.Logger):
     stop_task.cancel()
     await asyncio.gather(run_task, stop_task, return_exceptions=True)
 
+    # 엔진이 예외로 죽었으면 로그를 남기고 0이 아닌 코드로 끝낸다. 조용히 0으로 끝나면
+    # 컨테이너가 재시작 루프를 돌아도 배포 확인이 알아채지 못한다.
+    if not run_task.cancelled() and run_task.exception() is not None:
+        logger.critical("엔진이 예외로 종료됨", exc_info=run_task.exception())
+        raise run_task.exception()
+
 async def main_async():
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")

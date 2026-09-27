@@ -2,6 +2,7 @@ import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -92,7 +93,11 @@ class AsyncRiskManager:
             # KIS API는 지수 자체 OHLCV에 별도 TR(FHKUP03500100)이 필요하므로 ETF로 대체
             kospi_data = await self.api_client.get_ohlcv("069500", "D", 100)
             if kospi_data.empty:
-                logger.warning("KOSPI data empty, skipping risk assessment.")
+                # 판정할 수 없으면 직전 상태를 믿지 않는다 (낡은 BULL 로 사이징을 키우지 않도록).
+                logger.warning("KOSPI data empty — 리스크 상태를 보수적으로 전환")
+                self.risk_status = "CAUTION"
+                if self.market_condition == "BULL":
+                    self.market_condition = "NORMAL"
                 return
 
             returns = kospi_data["close"].pct_change().dropna()
@@ -170,8 +175,14 @@ class AsyncRiskManager:
             logger.error(f"포지션 사이징 오류 {ticker}: {e}")
             return 0.0
 
-    async def plan_buy(self, ticker: str, price: float) -> BuyPlan:
-        """현재 계좌 상태에서 이 종목을 몇 주 살 수 있는지 정한다."""
+    async def plan_buy(self, ticker: str, price: float,
+                       local_positions: Optional[Dict[str, float]] = None) -> BuyPlan:
+        """현재 계좌 상태에서 이 종목을 몇 주 살 수 있는지 정한다.
+
+        local_positions: 봇이 알고 있는 포지션 {ticker: 매수금액}. 방금 접수해 잔고에
+        아직 안 잡힌 주문도 한도에 넣기 위해 받는다. 잔고만 보면 연속 매수 시 같은
+        한도를 여러 번 쓰게 된다.
+        """
         account = await self.api_client.get_account_summary()
         if not account:
             # 조회 실패는 "보유 없음"이 아니다. 한도를 확인할 수 없으면 사지 않는다.
@@ -180,6 +191,9 @@ class AsyncRiskManager:
         equity = float(account.get("total_evaluated_amount", 0))
         positions = account.get("positions", [])
         invested = float(sum(p.get("current_price", 0) * p.get("quantity", 0) for p in positions))
+        at_broker = {p.get("ticker") for p in positions}
+        unreflected = {t: amt for t, amt in (local_positions or {}).items() if t not in at_broker}
+        unreflected_amount = float(sum(unreflected.values()))
 
         ratio = await self.position_size_ratio(ticker)
         if ratio <= 0:
@@ -189,9 +203,9 @@ class AsyncRiskManager:
             price=price,
             target_amount=equity * ratio,
             equity=equity,
-            cash=float(account.get("available_amount", 0)),
-            invested=invested,
-            position_count=len(positions),
+            cash=max(0.0, float(account.get("available_amount", 0)) - unreflected_amount),
+            invested=invested + unreflected_amount,
+            position_count=len(positions) + len(unreflected),
             max_investment_ratio=config.MAX_INVESTMENT_RATIO,
             max_stock_count=config.MAX_STOCK_COUNT,
         )

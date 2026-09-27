@@ -634,6 +634,12 @@ class AsyncStockScreener:
             # Overnight 은 외국인·기관 동시 순매수가 필수 조건이다.
             if not investor_trend.get("data_available", True):
                 return {}
+            # 장중 판단(장중 모멘텀·오버나이트)에는 당일 수급이 필요하다. 추정치가 비어
+            # 확정치로 폴백하면 전 거래일 값이 온다 — 그것으로 "오늘 외국인·기관이
+            # 사고 있다"고 판단하지 않는다.
+            if (is_intraday or is_overnight_window) and investor_trend.get("source") == "confirmed" \
+                    and investor_trend.get("as_of") != datetime.now().strftime("%Y%m%d"):
+                return {}
 
             # 2. 장중 판단(장중 모멘텀·오버나이트)은 당일 봉이 필요하다. 실시간 시세로
             #    당일 봉을 만들어 붙인다. 프리마켓은 완성된 일봉만 쓴다 (Issue #10-A).

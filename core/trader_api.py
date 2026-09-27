@@ -178,7 +178,7 @@ class AsyncKisAPI:
         if self._cb_open_until and datetime.now() < self._cb_open_until:
             remaining = int((self._cb_open_until - datetime.now()).total_seconds())
             logger.warning(f"[서킷브레이커] 차단 중 ({remaining}초 남음) tr_id={tr_id}")
-            return {"rt_cd": "-1", "msg1": "Circuit breaker open"}
+            return self._not_sent("Circuit breaker open")
 
         url = urljoin(self.base_url, path)
         max_retries = 5
@@ -198,11 +198,11 @@ class AsyncKisAPI:
                                 except Exception:
                                     text = await response.text()
                                     logger.error(f"API HTTP 500 Error: {text}")
-                                    return {"rt_cd": "-1", "msg1": "HTTP 500"}
+                                    return self._transport_failure("HTTP 500", resend_on_error)
                             elif response.status != 200:
                                 text = await response.text()
                                 logger.error(f"API Request Error: {response.status} - {text}")
-                                return {"rt_cd": "-1", "msg1": "HTTP Error"}
+                                return self._transport_failure(f"HTTP {response.status}", resend_on_error)
                             else:
                                 res_data = await response.json()
 
@@ -227,8 +227,8 @@ class AsyncKisAPI:
                                         logger.info("토큰이 이미 갱신됨 — 건너뜀")
                                     elif not await asyncio.to_thread(self._sync_init):
                                         logger.error("토큰 재발급 실패")
-                                        return {"rt_cd": "-1", "msg_cd": "TOKEN_REFRESH_FAILED",
-                                                "msg1": "Token refresh failed"}
+                                        return {**self._not_sent("Token refresh failed"),
+                                                "msg_cd": "TOKEN_REFRESH_FAILED"}
                                 continue
 
                             async with self._cb_lock:
@@ -245,7 +245,7 @@ class AsyncKisAPI:
                         if not resend_on_error:
                             return {"rt_cd": "-1", "msg_cd": "UNCONFIRMED",
                                     "msg1": f"응답 미수신({type(e).__name__}) — 접수 여부 미확인",
-                                    "_unconfirmed": True}
+                                    "_unconfirmed": True, "_transport_failure": True}
                         if attempt < max_retries - 1:
                             await asyncio.sleep(1.0)
 
@@ -256,10 +256,27 @@ class AsyncKisAPI:
                         self._cb_open_until = datetime.now() + timedelta(seconds=self._cb_open_seconds)
                         logger.error(f"[서킷브레이커] 연속 {self._cb_failure_count}회 실패 → {self._cb_open_seconds}초 차단")
                         self._cb_failure_count = 0
-                return {"rt_cd": "-1", "msg1": "Max retries exceeded"}
+                return self._not_sent("Max retries exceeded")
 
             finally:
                 pass
+
+    @staticmethod
+    def _not_sent(reason: str) -> dict:
+        """요청이 KIS 에 받아들여지지 않은 것이 확실한 실패 (KIS 의 판단이 아님).
+
+        호출부는 이것을 "KIS 가 거부했다"와 구분해야 한다. 서킷이 60초 열린 동안의
+        매도 실패를 주문 거부로 세면 멀쩡한 포지션의 손절이 막힌다.
+        """
+        return {"rt_cd": "-1", "msg1": reason, "_transport_failure": True}
+
+    @staticmethod
+    def _transport_failure(reason: str, resend_on_error: bool) -> dict:
+        """HTTP 오류 응답. 주문이면 접수 여부를 알 수 없으므로 미확인으로 돌려준다."""
+        res = {"rt_cd": "-1", "msg1": reason, "_transport_failure": True}
+        if not resend_on_error:
+            res.update({"msg_cd": "UNCONFIRMED", "_unconfirmed": True})
+        return res
 
     async def _wait_rate_limit(self):
         """정확한 1초 슬라이딩 윈도우 레이트 리미터. KIS 초당 20건 제한(실전) 준수."""
@@ -321,14 +338,8 @@ class AsyncKisAPI:
         # FHKST01010400 은 요청 범위와 무관하게 최근 30행만 준다. 그보다 긴 구간이
         # 필요한 호출(MA60, MACD 26/9, ADX 등)은 1회 100행을 주는 FHKST03010100 을 쓴다.
         if period_code == "D" and count > 30:
-            end_dt = datetime.now()
-            start_dt = end_dt - timedelta(days=int(count * 1.6) + 20)
-            df = await self.get_ohlcv_by_range(
-                ticker, start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d"),
-                period_code="D", quiet=True,
-            )
+            df = await self._recent_daily_bars(ticker, count)
             if not df.empty:
-                df = df.tail(count).reset_index(drop=True)
                 self._cache_put(self._ohlcv_cache, cache_key, df)
             return df
 
@@ -404,6 +415,72 @@ class AsyncKisAPI:
 
         return pd.DataFrame()
 
+    # 최근 일봉이 이보다 오래됐으면 조회가 부분 실패한 것으로 본다 (연휴 최장 기간 + 여유)
+    _MAX_BAR_AGE_DAYS = 12
+
+    async def _recent_daily_bars(self, ticker: str, count: int) -> pd.DataFrame:
+        """최근 count 개 일봉. 하나라도 빠졌을 수 있으면 빈 DataFrame 을 돌려준다.
+
+        FHKST03010100 은 범위가 넓어도 최근 100행만 주므로 100행까지는 1회 호출이다.
+        일부 구간만 받은 데이터를 정상처럼 돌려주면 몇 달 전 봉 위에 오늘 시세를 얹어
+        지표를 계산하게 된다.
+        """
+        end_dt = datetime.now()
+        if count <= 100:
+            start_dt = end_dt - timedelta(days=int(count * 1.6) + 20)
+            df = await self._daily_chart_chunk(ticker, start_dt, end_dt)
+            if df is None:
+                return pd.DataFrame()
+        else:
+            start_dt = end_dt - timedelta(days=int(count * 1.6) + 20)
+            df = await self.get_ohlcv_by_range(
+                ticker, start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d"),
+                quiet=True, strict=True,
+            )
+        if df.empty:
+            return df
+        df = df.sort_values("date").reset_index(drop=True)
+        age = (end_dt - df["date"].iloc[-1]).days
+        if age > self._MAX_BAR_AGE_DAYS:
+            logger.warning(f"[{ticker}] 최근 일봉이 {age}일 전 — 조회 실패로 처리")
+            return pd.DataFrame()
+        return df.tail(count).reset_index(drop=True)
+
+    async def _daily_chart_chunk(self, ticker: str, start_dt: datetime, end_dt: datetime,
+                                 period_code: str = "D", market_code: str = "J") -> Optional[pd.DataFrame]:
+        """FHKST03010100 1회 호출. 실패 시 None, 데이터 없음은 빈 DataFrame."""
+        res = await self._fetch(
+            "GET",
+            "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+            "FHKST03010100",
+            params={
+                "FID_COND_MRKT_DIV_CODE": market_code,
+                "FID_INPUT_ISCD": ticker,
+                "FID_INPUT_DATE_1": start_dt.strftime("%Y%m%d"),
+                "FID_INPUT_DATE_2": end_dt.strftime("%Y%m%d"),
+                "FID_PERIOD_DIV_CODE": period_code,
+                "FID_ORG_ADJ_PRC": "0",
+            },
+        )
+        if res.get("rt_cd") != "0":
+            return None
+        data_list = [r for r in (res.get("output2") or []) if r.get("stck_bsop_date")]
+        cols = ["date", "open", "high", "low", "close", "volume", "amount"]
+        if not data_list:
+            return pd.DataFrame(columns=cols)
+        df = pd.DataFrame(data_list).rename(columns={
+            "stck_bsop_date": "date", "stck_oprc": "open", "stck_hgpr": "high",
+            "stck_lwpr": "low", "stck_clpr": "close", "acml_vol": "volume", "acml_tr_pbmn": "amount",
+        })
+        for c in cols[1:]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        if "amount" not in df.columns or df["amount"].isnull().all():
+            df["amount"] = df["close"] * df["volume"]
+        df = df[[c for c in cols if c in df.columns]]
+        df["date"] = pd.to_datetime(df["date"], format="%Y%m%d", errors="coerce")
+        return df
+
     async def get_ohlcv_by_range(
         self,
         ticker: str,
@@ -412,6 +489,7 @@ class AsyncKisAPI:
         period_code: str = "D",
         market_code: str = "J",
         quiet: bool = False,
+        strict: bool = False,
     ) -> pd.DataFrame:
         """
         날짜 범위 지정 OHLCV 수집 (TR: FHKST03010100).
@@ -425,20 +503,11 @@ class AsyncKisAPI:
             end_date: 조회 종료일 "YYYYMMDD"
             period_code: "D"(일봉), "W"(주봉), "M"(월봉)
             market_code: "J"(KRX 기본)
+            strict: True 면 청크가 하나라도 실패할 때 빈 DataFrame (라이브 지표 계산용)
 
         Returns:
             pd.DataFrame: date/open/high/low/close/volume/amount 정렬된 DataFrame
         """
-        col_map = {
-            "stck_bsop_date": "date",
-            "stck_oprc": "open",
-            "stck_hgpr": "high",
-            "stck_lwpr": "low",
-            "stck_clpr": "close",
-            "acml_vol": "volume",
-            "acml_tr_pbmn": "amount",
-        }
-
         start_dt = datetime.strptime(start_date, "%Y%m%d")
         end_dt = datetime.strptime(end_date, "%Y%m%d")
         all_frames: List[pd.DataFrame] = []
@@ -448,39 +517,17 @@ class AsyncKisAPI:
         chunk_end = end_dt
         while chunk_end >= start_dt:
             chunk_start = max(start_dt, chunk_end - timedelta(days=chunk_days))
-            params = {
-                "FID_COND_MRKT_DIV_CODE": market_code,
-                "FID_INPUT_ISCD": ticker,
-                "FID_INPUT_DATE_1": chunk_start.strftime("%Y%m%d"),
-                "FID_INPUT_DATE_2": chunk_end.strftime("%Y%m%d"),
-                "FID_PERIOD_DIV_CODE": period_code,
-                "FID_ORG_ADJ_PRC": "0",  # 수정주가
-            }
-            res = await self._fetch(
-                "GET",
-                "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
-                "FHKST03010100",
-                params=params,
-            )
-            data_list = [r for r in (res.get("output2") or []) if r.get("stck_bsop_date")]
-            if res.get("rt_cd") == "0" and data_list:
-                df_chunk = pd.DataFrame(data_list)
-                df_chunk.rename(columns=col_map, inplace=True)
-                cols = ["date", "open", "high", "low", "close", "volume", "amount"]
-                for c in cols[1:]:
-                    if c in df_chunk.columns:
-                        df_chunk[c] = pd.to_numeric(df_chunk[c], errors="coerce")
-                if "amount" not in df_chunk.columns or df_chunk["amount"].isnull().all():
-                    df_chunk["amount"] = df_chunk["close"] * df_chunk["volume"]
-                df_chunk = df_chunk[[c for c in cols if c in df_chunk.columns]]
-                df_chunk["date"] = pd.to_datetime(df_chunk["date"], format="%Y%m%d", errors="coerce")
+            df_chunk = await self._daily_chart_chunk(ticker, chunk_start, chunk_end,
+                                                     period_code, market_code)
+            if df_chunk is None:
+                logger.warning(f"[{ticker}] FHKST03010100 청크 실패 "
+                               f"({chunk_start:%Y%m%d}~{chunk_end:%Y%m%d})")
+                if strict:
+                    return pd.DataFrame()
+            elif not df_chunk.empty:
                 all_frames.append(df_chunk)
-            else:
-                logger.warning(f"[{ticker}] FHKST03010100 청크 실패 ({chunk_start.strftime('%Y%m%d')}~{chunk_end.strftime('%Y%m%d')}): {res.get('msg1','')}")
 
             chunk_end = chunk_start - timedelta(days=1)
-            if chunk_end < start_dt:
-                break
 
         if not all_frames:
             (logger.debug if quiet else logger.error)(f"[{ticker}] get_ohlcv_by_range: 수집된 데이터 없음")
@@ -599,10 +646,18 @@ class AsyncKisAPI:
             # 예수금총액(dnca)은 D+2 결제 전까지 당일 매수분이 빠지지 않는다. 당일 매수를
             # 반영하는 D+2 예수금(prvs)과 비교해 작은 쪽을 쓴다. 둘 다 0이면 CMA 계좌.
             dnca = self._to_int(summary.get("dnca_tot_amt"))
-            prvs = self._to_int(summary.get("prvs_rcdl_excc_amt"))
             cma = self._to_int(summary.get("cma_evlu_amt"))
-            cash_candidates = [v for v in (dnca, prvs) if v > 0]
-            available = min(cash_candidates) if cash_candidates else cma
+            prvs_raw = str(summary.get("prvs_rcdl_excc_amt") or "").strip()
+            if prvs_raw:
+                # D+2 예수금이 0 이하면 당일 매수로 현금을 다 쓴 것이다. 매수 전
+                # 예수금으로 되돌아가면 미수 주문이 나갈 수 있다.
+                prvs = self._to_int(prvs_raw)
+                available = min(dnca, prvs)
+                if dnca == 0 and prvs == 0:
+                    available = cma
+            else:
+                available = dnca or cma
+            available = max(0, available)
 
             return {
                 "total_evaluated_amount": self._to_int(summary.get("tot_evlu_amt")),

@@ -9,7 +9,6 @@ import config
 from core.trader_api import AsyncKisAPI
 from risk.async_risk_manager import AsyncRiskManager
 from utils import market_calendar
-from utils.costs import net_pnl
 from utils.state_store import load_state, save_state
 from utils.utils import get_trading_time_status
 
@@ -23,7 +22,7 @@ REBUY_COOLDOWN_SECONDS = 1800
 # 재시작 후에도 유지해야 하는 포지션 필드
 _PERSISTED_FIELDS = (
     "ticker", "name", "quantity", "buy_price", "high_price", "entry_time",
-    "reason", "stop_price", "buy_trade_id", "pending_sell", "origin",
+    "reason", "stop_price", "buy_trade_id", "pending_sell", "origin", "seen_at_broker",
 )
 
 PositionRecoverer = Callable[[str], Awaitable[Optional[dict]]]
@@ -52,6 +51,11 @@ class AsyncTradingStrategy:
         self.position_recoverer: Optional[PositionRecoverer] = None
         # 출처를 알 수 없어 Standard 규칙으로 편입한 종목 — trader 가 알림 후 비운다.
         self.adopted_unknown: List[str] = []
+        # 잔고에서 사라진 것이 확인된 청산 — trader 가 손익 기록·알림 후 비운다.
+        self.closed_positions: List[dict] = []
+        # 매수 접수 후 유예 시간 안에 잔고에 잡히지 않은 주문. 늦게 체결되면 여기서
+        # 메타데이터를 되찾고, 그동안 같은 종목을 다시 사지 않는다.
+        self._unfilled_entries: Dict[str, dict] = self._load_entries("unfilled_entries")
 
         self.take_profit_ratio = config.TAKE_PROFIT_RATIO
         self.stop_loss_ratio = config.STOP_LOSS_RATIO
@@ -62,33 +66,49 @@ class AsyncTradingStrategy:
     # 포지션 영속화
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _load_positions() -> Dict[str, dict]:
+    @classmethod
+    def _load_positions(cls) -> Dict[str, dict]:
         """저장된 포지션 메타데이터 복원.
 
         메모리에만 두면 재시작·재배포 때 reason/entry_time 이 사라져 Overnight 로 산
         종목이 다른 청산 규칙을 타고 보유일 시계도 0으로 돌아간다.
         """
+        restored = cls._load_entries("positions")
+        if restored:
+            logger.info(f"[포지션복원] {len(restored)}종목: "
+                        f"{[(t, i.get('reason')) for t, i in restored.items()]}")
+        return restored
+
+    @staticmethod
+    def _load_entries(state_name: str) -> Dict[str, dict]:
         restored: Dict[str, dict] = {}
-        for ticker, info in (load_state("positions", {}) or {}).items():
+        for ticker, info in (load_state(state_name, {}) or {}).items():
             try:
                 info = dict(info)
                 info["entry_time"] = datetime.fromisoformat(info["entry_time"])
                 restored[ticker] = info
             except (KeyError, TypeError, ValueError) as e:
                 logger.error(f"[포지션복원] {ticker} 메타데이터 손상 — 건너뜀: {e}")
-        if restored:
-            logger.info(f"[포지션복원] {len(restored)}종목: "
-                        f"{[(t, i.get('reason')) for t, i in restored.items()]}")
         return restored
 
-    def _persist(self) -> None:
+    @staticmethod
+    def _serializable(entries: Dict[str, dict]) -> Dict[str, dict]:
         data = {}
-        for ticker, info in self.holdings.items():
-            row = {k: info.get(k) for k in _PERSISTED_FIELDS if k in info}
+        for ticker, info in entries.items():
+            row = {}
+            for k in _PERSISTED_FIELDS:
+                if k not in info:
+                    continue
+                v = info[k]
+                # 잔고·시세에서 온 numpy 스칼라는 json 이 직렬화하지 못한다
+                row[k] = v.item() if hasattr(v, "item") else v
             row["entry_time"] = info["entry_time"].isoformat()
             data[ticker] = row
-        save_state("positions", data)
+        return data
+
+    def _persist(self) -> None:
+        save_state("positions", self._serializable(self.holdings))
+        save_state("unfilled_entries", self._serializable(self._unfilled_entries))
 
     def set_candidate_stocks(self, candidate_stocks):
          self.candidate_stocks = candidate_stocks
@@ -105,6 +125,10 @@ class AsyncTradingStrategy:
               self._unsellable_tickers.clear()
          cutoff = datetime.now().timestamp() - REBUY_COOLDOWN_SECONDS
          self._recently_sold = {t: ts for t, ts in self._recently_sold.items() if ts > cutoff}
+         if self._unfilled_entries:
+              logger.info(f"[일별초기화] 미체결 매수 기록 정리: {sorted(self._unfilled_entries)}")
+              self._unfilled_entries.clear()
+              self._persist()
 
     def open_tickers(self) -> List[str]:
          """청산 판단 대상 — 매도 주문이 걸려 있거나 매도 차단된 종목은 제외."""
@@ -143,6 +167,7 @@ class AsyncTradingStrategy:
               info["profit_loss"] = pos.get("eval_profit_loss", 0)
               info["high_price"] = max(info.get("high_price") or 0, info["current_price"])
               info.pop("unconfirmed", None)
+              info["seen_at_broker"] = True
 
               pending = info.get("pending_sell")
               if pending and info["sellable_quantity"] > 0:
@@ -160,12 +185,20 @@ class AsyncTradingStrategy:
                    continue
               if info.get("pending_sell"):
                    logger.info(f"[청산확정] {ticker}: 잔고에서 제거됨")
+                   self.closed_positions.append(dict(info))
+                   self._recently_sold[ticker] = now.timestamp()
                    continue
               age = (now - info["entry_time"]).total_seconds()
               if age < ENTRY_FILL_GRACE_SECONDS:
                    reconciled[ticker] = info   # 매수 체결이 아직 잔고에 안 잡힘
                    continue
-              logger.warning(f"[포지션소실] {ticker}: 잔고에 없음 — 미체결 또는 외부 매도로 보고 제거")
+              if info.get("origin") == "bot" and not info.get("seen_at_broker"):
+                   # 한 번도 잔고에 잡힌 적 없는 매수. 체결이 늦는 것일 수 있으니 기록을
+                   # 남겨 두고(늦게 잡히면 복원), 오늘은 같은 종목을 다시 사지 않는다.
+                   logger.warning(f"[매수미체결] {ticker}: 접수 {age:.0f}초 후에도 잔고에 없음")
+                   self._unfilled_entries[ticker] = info
+                   continue
+              logger.warning(f"[포지션소실] {ticker}: 잔고에 없음 — 외부 매도로 보고 제거")
 
          self.holdings = reconciled
          self._persist()
@@ -173,6 +206,11 @@ class AsyncTradingStrategy:
 
     async def _adopt_position(self, ticker: str, now: datetime) -> dict:
          """잔고에는 있는데 로컬 메타데이터가 없는 포지션."""
+         late = self._unfilled_entries.pop(ticker, None)
+         if late:
+              logger.warning(f"[매수체결확인] {ticker}: 유예 시간 이후 체결 — 메타데이터 복원")
+              return dict(late)
+
          if self.position_recoverer is not None:
               try:
                    recovered = await self.position_recoverer(ticker)
@@ -391,6 +429,8 @@ class AsyncTradingStrategy:
         async with self._order_lock:
             if ticker in self.holdings:
                 return self._reject(ticker, "이미 보유 중")
+            if ticker in self._unfilled_entries:
+                return self._reject(ticker, "오늘 접수한 매수 주문의 체결 여부 미확인")
 
             can, msg = await self.risk_manager.can_trade(ticker, "buy")
             if not can:
@@ -401,7 +441,11 @@ class AsyncTradingStrategy:
             if not current_price:
                 return self._reject(ticker, "현재가 조회 실패")
 
-            plan = await self.risk_manager.plan_buy(ticker, current_price)
+            local_positions = {
+                t: float(i.get("buy_price", 0)) * i.get("quantity", 0)
+                for t, i in {**self._unfilled_entries, **self.holdings}.items()
+            }
+            plan = await self.risk_manager.plan_buy(ticker, current_price, local_positions)
             if not plan.ok:
                 return self._reject(ticker, plan.reason)
             buy_qty = min(quantity, plan.quantity) if quantity > 0 else plan.quantity
@@ -486,30 +530,19 @@ class AsyncTradingStrategy:
 
             accepted = result.get("rt_cd") == "0"
             if accepted or result.get("_unconfirmed"):
+                # 손익은 여기서 기록하지 않는다. 접수된 주문이 체결 없이 풀릴 수 있고,
+                # 그러면 같은 포지션의 손익이 두 번 잡힌다. 잔고에서 사라진 것이
+                # 확인되면 closed_positions 로 넘어가고 trader 가 그때 기록한다.
                 info["pending_sell"] = {
                     "at": datetime.now().isoformat(),
                     "reason": reason,
                     "quantity": sell_qty,
+                    "price": await self._current_price(ticker, info),
+                    "confirmed": accepted,
                 }
                 info["sellable_quantity"] = sellable - sell_qty
-                self._persist()
-            if accepted:
-                current_price = await self._current_price(ticker, info)
-                buy_price = info.get("buy_price", 0)
-                pnl_amount, profit_ratio = net_pnl(buy_price, current_price, sell_qty)
-                self.order_history.append({
-                    "action": "SELL",
-                    "ticker": ticker,
-                    "name": info.get("name", ticker),
-                    "quantity": sell_qty,
-                    "price": current_price or 0,
-                    "time": datetime.now().isoformat(),
-                    "reason": reason,
-                    "strategy": info.get("reason", "Standard"),
-                    "profit_ratio": profit_ratio,   # 수수료·거래세 차감 후
-                    "pnl_amount": pnl_amount,
-                })
                 self._recently_sold[ticker] = datetime.now().timestamp()
+                self._persist()
             elif result.get("_unsellable"):
                 self._unsellable_tickers.add(ticker)
                 logger.warning(f"[매도차단] {ticker}: 거래정지/매매불가 — 당일 재시도하지 않음")
