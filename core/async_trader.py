@@ -364,14 +364,16 @@ class AsyncAutoTrader:
     async def _monitor_loop(self):
         """보유 포지션 청산 조건 + 연속 시그널 모니터링 (장 중 매 10초)."""
         while self.running:
-            from utils.utils import is_market_open
-            
-            # 주말 및 공휴일일 때는 아무것도 하지 않고 대기
-            if not is_market_open():
+            from utils.utils import is_trading_day
+
+            now = datetime.now()
+            # 휴장일이면 대기. 개장일 판정은 스케줄러와 동일한 캐시를 공유하므로
+            # APBK0919로 당일 매매 중단이 결정되면 이 루프도 함께 멈춘다.
+            # (is_market_open()을 쓰면 중단 결정이 반영되지 않아 10초마다 재시도한다)
+            if not await self._confirm_open_day(now, is_trading_day()):
                  await asyncio.sleep(60)
                  continue
-                 
-            now = datetime.now()
+
             # 09:00~15:30 사이에만 실행
             if 9 <= now.hour < 15 or (now.hour == 15 and now.minute <= 30):
                 # 1. 청산 조건 체크
