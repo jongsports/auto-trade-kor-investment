@@ -488,8 +488,12 @@ class AsyncKisAPI:
             logger.warning(f"[휴장일조회] 실패 msg_cd={res.get('msg_cd')} {res.get('msg1')}")
             return None
 
-        for row in res.get("output", []) or []:
-            if row.get("bass_dt") == date_str:
+        # KIS는 단일 건일 때 output을 list가 아닌 dict로 주는 경우가 있다.
+        rows = res.get("output") or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        for row in rows:
+            if isinstance(row, dict) and row.get("bass_dt") == date_str:
                 return row.get("opnd_yn") == "Y"
         logger.warning(f"[휴장일조회] {date_str} 응답에 해당 일자 없음")
         return None
