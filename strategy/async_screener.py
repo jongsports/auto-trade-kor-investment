@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import config
 from core.trader_api import AsyncKisAPI
 from data.async_news_analyzer import AsyncNewsAnalyzer
@@ -33,36 +33,74 @@ class AsyncStockScreener:
     # 시장 종목 조회
     # ------------------------------------------------------------------
 
-    async def get_market_stocks(self, market="KOSPI") -> List[str]:
-        """거래량/거래대금 상위 종목 조회 (Dynamic). Issue #10-D: KOSPI 50, KOSDAQ 30으로 확대."""
-        if market == "KOSPI":
-            return await self.api_client.get_top_market_stocks("0001", count=50)
-        elif market == "KOSDAQ":
-            return await self.api_client.get_top_market_stocks("1001", count=30)
-        return []
+    async def _affordable_max_price(self) -> int:
+        """계좌 규모로 1주라도 살 수 있는 가격 상한.
+
+        사이징은 종목당 (max_stock_ratio × 0.3~1.5)를 배정하므로 상한은 1.5배 기준이다.
+        이보다 비싼 종목은 진입 단계에서 반드시 탈락하니 스크리닝할 이유가 없다.
+        조회 실패 시 0 (상한 없음) — 진입 단계가 한도를 다시 확인한다.
+        """
+        account = await self.api_client.get_account_summary()
+        equity = account.get("total_evaluated_amount", 0) if account else 0
+        return int(equity * config.MAX_STOCK_RATIO * 1.5)
+
+    async def get_market_stocks(self, market="KOSPI", max_price: int = 0) -> List[str]:
+        """거래대금 상위 종목 (시장당 최대 30건 — KIS 순위분석 1회 응답 상한)."""
+        code = {"KOSPI": "0001", "KOSDAQ": "1001"}.get(market)
+        if code is None:
+            return []
+        return await self.api_client.get_top_market_stocks(
+            code, min_price=config.MIN_PRICE, max_price=max_price)
 
     async def get_volume_surge_stocks(self) -> List[tuple]:
-        """장중 거래량 급증 종목 탐색 (KOSPI 상위 30 + KOSDAQ 상위 20).
-
-        Bug #3 fix (2026-04-24): 기존에는 메서드 자체가 없어서 연속시그널 스캐너가
-        15분마다 AttributeError → 거래량 급증 종목을 단 한 번도 추적하지 못했음.
-        KIS 'get_top_market_stocks' (거래대금 상위) 를 surge proxy로 사용.
+        """장중 거래량 급증 종목 (거래증가율 순).
 
         Returns:
             [(ticker, market), ...] 형태. 연속시그널 스캐너가 기대하는 포맷.
         """
+        max_price = await self._affordable_max_price()
         pairs: List[tuple] = []
-        try:
-            kospi = await self.api_client.get_top_market_stocks("0001", count=30)
-            pairs.extend((t, "KOSPI") for t in kospi)
-        except Exception as e:
-            logger.debug(f"[get_volume_surge_stocks] KOSPI 오류: {e}")
-        try:
-            kosdaq = await self.api_client.get_top_market_stocks("1001", count=20)
-            pairs.extend((t, "KOSDAQ") for t in kosdaq)
-        except Exception as e:
-            logger.debug(f"[get_volume_surge_stocks] KOSDAQ 오류: {e}")
+        for market, code in (("KOSPI", "0001"), ("KOSDAQ", "1001")):
+            tickers = await self.api_client.get_volume_surge_stocks(
+                code, min_price=config.MIN_PRICE, max_price=max_price)
+            pairs.extend((t, market) for t in tickers)
         return pairs
+
+    # ------------------------------------------------------------------
+    # 당일 봉 처리
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _completed_bars(ohlcv: pd.DataFrame, today=None) -> pd.DataFrame:
+        """오늘 날짜의 (진행 중인) 봉을 뺀 일봉."""
+        today = pd.Timestamp(today or datetime.now().date())
+        return ohlcv[pd.to_datetime(ohlcv["date"]).dt.normalize() < today]
+
+    @classmethod
+    def _with_today_bar(cls, ohlcv: pd.DataFrame, price_data: Dict[str, Any], today=None) -> pd.DataFrame:
+        """실시간 시세로 당일 봉을 만들어 붙인다.
+
+        KIS 일봉 응답이 당일 봉을 포함하든 아니든 결과가 같도록, 기존 당일 행을 지운
+        뒤 하나만 붙인다. 예전에는 무조건 append 해서 당일 봉이 두 번 들어갈 수 있었다.
+        """
+        today = pd.Timestamp(today or datetime.now().date())
+        row = {
+            "date": today,
+            "open": price_data["open"],
+            "high": price_data["high"],
+            "low": price_data["low"],
+            "close": price_data["price"],
+            "volume": price_data["volume"],
+            "amount": price_data["amount"],
+        }
+        return pd.concat([cls._completed_bars(ohlcv, today), pd.DataFrame([row])], ignore_index=True)
+
+    @staticmethod
+    def _session_elapsed_fraction(now: Optional[datetime] = None) -> float:
+        """정규장(09:00~15:30) 중 경과 비율. 장 시작 전 0, 마감 후 1."""
+        now = now or datetime.now()
+        elapsed = (now.hour * 60 + now.minute) - 9 * 60
+        return min(1.0, max(0.0, elapsed / 390))
 
     # ------------------------------------------------------------------
     # 시초가 갭 검증
@@ -83,16 +121,17 @@ class AsyncStockScreener:
             if not ticker:
                 continue
             try:
-                ohlcv = await self.api_client.get_ohlcv(ticker, count=2)  # Issue #9-A: period_code 기본값 "D" 사용
-                if ohlcv.empty or len(ohlcv) < 2:
-                    validated.append(c)
+                ohlcv = await self.api_client.get_ohlcv(ticker, count=5)
+                price_data = await self.api_client.get_current_price(ticker)
+                completed = self._completed_bars(ohlcv) if not ohlcv.empty else ohlcv
+                if completed.empty or not price_data or not price_data.get("open"):
+                    logger.info(f"[갭 검증 불가] {ticker}: 시세 없음 — 제외")
                     continue
 
-                prev_close = float(ohlcv["close"].iloc[-2])
-                today_open = float(ohlcv["open"].iloc[-1])
+                prev_close = float(completed["close"].iloc[-1])
+                today_open = float(price_data["open"])
 
                 if prev_close <= 0:
-                    validated.append(c)
                     continue
 
                 gap = (today_open - prev_close) / prev_close
@@ -109,8 +148,8 @@ class AsyncStockScreener:
                 validated.append(c)
 
             except Exception as e:
-                logger.error(f"[갭 검증 오류] {ticker}: {e}")
-                validated.append(c)  # 오류 시 보수적으로 포함
+                # 갭을 확인하지 못한 종목은 사지 않는다.
+                logger.error(f"[갭 검증 오류] {ticker}: {e} — 제외")
 
         logger.info(f"[갭 필터] {len(candidates)}종목 → {len(validated)}종목 통과")
         return validated
@@ -224,15 +263,20 @@ class AsyncStockScreener:
         is_breaking_bb   = df["close"].iloc[-1] >= (df["bb_upper"].iloc[-1] * 0.98)
         return is_macd_bullish and is_rsi_safe and is_breaking_bb
 
-    def check_volume_surge(self, df: pd.DataFrame) -> bool:
-        """거래량이 20일 MA의 2배 이상."""
-        if len(df) < 20:
+    def check_volume_surge(self, df: pd.DataFrame, elapsed_fraction: float = 1.0) -> bool:
+        """거래량이 20일 MA의 2배 이상.
+
+        마지막 봉이 진행 중이면 누적 거래량을 하루치로 환산해 비교한다. 환산 없이
+        10:30 의 누적 거래량을 하루치 평균과 비교하면 오전에는 거의 통과할 수 없다.
+        장 초반 과대 환산을 막기 위해 경과 비율 하한을 20%로 둔다.
+        """
+        if len(df) < 21:
             return False
-        try:
-            vol_ma20_prev = max(df["volume_ma20"].iloc[-2], 1.0)
-            return df["volume"].iloc[-1] / vol_ma20_prev >= 2.0
-        except Exception:
+        vol_ma20_prev = df["volume_ma20"].iloc[-2]
+        if not vol_ma20_prev or pd.isna(vol_ma20_prev):
             return False
+        projected = df["volume"].iloc[-1] / max(elapsed_fraction, 0.2)
+        return projected / vol_ma20_prev >= 2.0
 
     def check_moving_average(self, df: pd.DataFrame) -> bool:
         """정배열 (종가 > MA20 > MA60) + 이격도 과도 확장 아님."""
@@ -356,8 +400,7 @@ class AsyncStockScreener:
     # 세션별 진입 임계값
     # ------------------------------------------------------------------
 
-    def get_entry_threshold(self, is_overnight_window: bool = False,
-                            market_regime: str = "NORMAL") -> int:
+    def get_entry_threshold(self, is_overnight_window: bool = False) -> int:
         """
         현재 거래 세션에 따라 최소 진입 점수 반환.
 
@@ -387,7 +430,8 @@ class AsyncStockScreener:
         is_overnight_window: bool = False,
         is_intraday: bool = False,
         intraday_data: Dict[str, Any] = None,
-        news_score: float = 0.0
+        news_score: float = 0.0,
+        elapsed_fraction: float = 1.0,
     ) -> dict:
         """
         100점 만점 모멘텀 Confluence 스코어링.
@@ -402,21 +446,8 @@ class AsyncStockScreener:
         Returns:
             dict: {total, technical, volume, order_flow, news, overnight_bonus}
         """
-        df = ohlcv_data.copy()
-        if is_intraday and intraday_data:
-            # Append today's progress as a new row or update last row for real-time analysis
-            today_row = {
-                "date": datetime.now(),
-                "open": intraday_data["open"],
-                "high": intraday_data["high"],
-                "low": intraday_data["low"],
-                "close": intraday_data["price"],
-                "volume": intraday_data["volume"],
-                "amount": intraday_data["amount"]
-            }
-            df = pd.concat([df, pd.DataFrame([today_row])], ignore_index=True)
-
-        df = self.calculate_technical_indicators(df)
+        # 당일 봉 병합은 호출부(_process_ticker)가 _with_today_bar 로 끝낸 상태다.
+        df = self.calculate_technical_indicators(ohlcv_data)
         if len(df) < 5: return {"total": 0}
 
         technical_score  = 0   # max 40
@@ -454,7 +485,8 @@ class AsyncStockScreener:
         # ── CATEGORY 2: 거래량 품질 (max 20) ─────────────────────────────
 
         # 거래량 급증 ≥ MA20 × 2배 (10pts)
-        if self.check_volume_surge(df):
+        volume_surge = self.check_volume_surge(df, elapsed_fraction)
+        if volume_surge:
             volume_score += 10
 
         # 종가 > MA20 정배열 기본 (5pts)
@@ -485,14 +517,15 @@ class AsyncStockScreener:
             if open_price > 0 and current_price >= open_price * 1.02:
                 intraday_bonus += 10
             
-            # 2. 거래량 강도 (전일 평균 거래량의 50%를 이미 초과했는지 등)
-            avg_volume = df["volume"].iloc[:-1].mean()
-            if avg_volume > 0 and intraday_data["volume"] > avg_volume * config.MIN_INTRADAY_VOLUME_RATIO:
+            # 2. 거래량 강도 — 하루치로 환산한 거래량이 평균을 넘는 속도인지
+            avg_volume = df["volume"].iloc[:-1].tail(20).mean()
+            projected = intraday_data["volume"] / max(elapsed_fraction, 0.2)
+            if avg_volume > 0 and projected > avg_volume:
                 intraday_bonus += 10
-            
-            # 가중치 적용: 차트/수급이 좋은데 실시간으로도 터지는 경우 배가시킴
-            total_raw = technical_score + volume_score + order_flow_score + news_pts
-            total = int(total_raw * config.INTRADAY_MOMENTUM_WEIGHT) + intraday_bonus
+
+            # 배수를 곱하지 않는다. 1.5배 후 100으로 자르면 후보의 3분의 1이 100점
+            # 동점이 되어 임계값도 순위도 의미가 없어진다.
+            total = technical_score + volume_score + order_flow_score + news_pts + intraday_bonus
         else:
             # ── OVERNIGHT WINDOW 특수 로직 (강화: 승률 18%→개선 목표) ──────────
             if is_overnight_window and len(df) > 0:
@@ -512,20 +545,23 @@ class AsyncStockScreener:
                         volume_score    = 0
                     else:
                         overnight_bonus = 15
-                        if close_position >= 0.9 and self.check_volume_surge(df):
+                        if close_position >= 0.9 and volume_surge:
                             overnight_bonus = 20
 
-                        # 외국인+기관 동시 순매수 필수 (기존: 한쪽만)
-                        trend_data_ok = investor_trend.get("data_available", True)
-                        if order_flow_score < 30 and trend_data_ok:
+                        # 외국인+기관 동시 순매수 필수
+                        if order_flow_score < 30:
                             technical_score = 0
                             volume_score    = 0
                             overnight_bonus = 0
+                else:
+                    # 고가=저가 (거래 없음/상하한가 고정) — 종가 위치를 판단할 수 없다
+                    technical_score = 0
+                    volume_score    = 0
 
             total = technical_score + volume_score + order_flow_score + news_pts + overnight_bonus
 
         return {
-            "total":           min(100, total),
+            "total":           max(0, min(100, total)),
             "technical":       technical_score,
             "volume":          volume_score,
             "order_flow":      order_flow_score,
@@ -594,18 +630,32 @@ class AsyncStockScreener:
                 logger.warning(f"[{ticker}] 데이터 부족 ({len(ohlcv_data)}행) - 건너뜀")
                 return {}
 
-            # 2. 현재가 — 인트라데이 모드만 실시간 조회 (Issue #10-A)
+            # 수급을 확인할 수 없으면 후보로 올리지 않는다. 점수의 30%가 수급이고
+            # Overnight 은 외국인·기관 동시 순매수가 필수 조건이다.
+            if not investor_trend.get("data_available", True):
+                return {}
+
+            # 2. 장중 판단(장중 모멘텀·오버나이트)은 당일 봉이 필요하다. 실시간 시세로
+            #    당일 봉을 만들어 붙인다. 프리마켓은 완성된 일봉만 쓴다 (Issue #10-A).
             current_price = float(ohlcv_data["close"].iloc[-1])
             intraday_data = None
-            if is_intraday:
+            elapsed_fraction = 1.0
+            if is_intraday or is_overnight_window:
                 price_data = await self.api_client.get_current_price(ticker)
-                if price_data:
-                    current_price = price_data.get("price", current_price)
+                if not price_data or not price_data.get("price"):
+                    logger.info(f"[{ticker}] 실시간 시세 조회 실패 - 건너뜀")
+                    return {}
+                current_price = price_data["price"]
+                ohlcv_data = self._with_today_bar(ohlcv_data, price_data)
+                elapsed_fraction = self._session_elapsed_fraction()
+                if is_intraday:
                     intraday_data = price_data
-                else:
-                    logger.debug(f"[{ticker}] 실시간 가격 조회 실패 - OHLCV 종가 사용")
+            else:
+                ohlcv_data = self._completed_bars(ohlcv_data)
+                if len(ohlcv_data) < 20:
+                    return {}
 
-            stock_name = ticker
+            stock_name = self.api_client.stock_names.get(ticker, ticker)
 
             # 4. 뉴스 점수 — 5초 타임아웃으로 파이프라인 블로킹 방지 (Issue #10-B)
             news_score_raw = 0.0
@@ -631,22 +681,12 @@ class AsyncStockScreener:
                 is_intraday=is_intraday,
                 intraday_data=intraday_data,
                 news_score=news_score_raw,
+                elapsed_fraction=elapsed_fraction,
             )
             total_score = score_dict["total"]
 
             # 6. 세션별 임계값 필터
-            threshold = self.get_entry_threshold(is_overnight_window)
-            # 수급 데이터 미수신 처리 (2026-05-17 강화):
-            # 기존: 임계값 0.75배 완화 → confluence 사상 무너짐 (수급 0인데 통과)
-            # 변경: 인트라데이는 차단, 오버나이트는 임계값 0.85배 완화 (보수적)
-            supply_missing = not investor_trend.get("data_available", True)
-            if supply_missing:
-                if is_overnight_window:
-                    threshold = max(1, int(threshold * 0.85))  # 오버나이트는 약간 완화
-                else:
-                    # 인트라데이는 수급 없이 진입 차단 (가짜 신호 방지)
-                    return {}
-            if total_score < threshold:
+            if total_score < self.get_entry_threshold(is_overnight_window):
                 return {}
 
             # 7. reason 태그 통일 — async_trader 필터링과 전략 청산 로직에서 정확히 매칭 (Issue #9-D)
@@ -690,9 +730,11 @@ class AsyncStockScreener:
         """
         tasks = []
 
-        logger.info(f"스크리닝 시작 (시장: {market_list}, 실시간 모멘텀: {is_intraday})")
+        max_price = await self._affordable_max_price()
+        logger.info(f"스크리닝 시작 (시장: {market_list}, 실시간 모멘텀: {is_intraday}, "
+                    f"가격 상한: {max_price:,}원)")
         for market in market_list:
-            tickers = await self.get_market_stocks(market)
+            tickers = await self.get_market_stocks(market, max_price=max_price)
             logger.info(f"{market}: {len(tickers)}개 종목 발견")
             for t in tickers:
                 tasks.append((t, market))

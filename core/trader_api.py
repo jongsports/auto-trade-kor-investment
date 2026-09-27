@@ -60,6 +60,8 @@ class AsyncKisAPI:
 
         # KIS 휴장일조회로 확인된 개장일 여부 {YYYYMMDD: bool}
         self.open_day_calendar: Dict[str, bool] = {}
+        # 순위분석 응답에서 얻은 종목명 {ticker: name}
+        self.stock_names: Dict[str, str] = {}
 
     async def init_session(self):
         """Initialize aiohttp session."""
@@ -936,15 +938,18 @@ class AsyncKisAPI:
         # This TR is slightly different and common for quotation rankings
         res = await self._fetch("GET", "/uapi/domestic-stock/v1/quotations/volume-rank", "FHPST01710000", params=params)
         
+        return self._rank_tickers(res)[:count]
+
+    def _rank_tickers(self, res: Dict[str, Any]) -> List[str]:
         tickers = []
-        if res.get("rt_cd") == "0" and "output" in res:
-            for item in res["output"]:
-                # mksc_shrn_iscd = 종목코드
+        if res.get("rt_cd") == "0":
+            for item in res.get("output") or []:
                 ticker = item.get("mksc_shrn_iscd")
                 if ticker:
                     tickers.append(ticker)
-                
-        return tickers[:count]
+                    if item.get("hts_kor_isnm"):
+                        self.stock_names[ticker] = item["hts_kor_isnm"].strip()
+        return tickers
 
     async def get_volume_surge_stocks(self, market_code="0001", count=20,
                                       min_price: int = 2000, max_price: int = 0) -> List[str]:
@@ -959,13 +964,7 @@ class AsyncKisAPI:
                 "GET", "/uapi/domestic-stock/v1/quotations/volume-rank",
                 "FHPST01710000", params=params
             )
-            tickers = []
-            if res.get("rt_cd") == "0" and "output" in res:
-                for item in res["output"]:
-                    ticker = item.get("mksc_shrn_iscd")
-                    if ticker:
-                        tickers.append(ticker)
-            return tickers[:count]
+            return self._rank_tickers(res)[:count]
         except Exception as e:
             logger.warning(f"거래량 급증 조회 실패: {e}")
             return []
