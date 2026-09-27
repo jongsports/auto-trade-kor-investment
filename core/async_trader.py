@@ -230,6 +230,7 @@ class AsyncAutoTrader:
                     await self.risk_manager.assess_market_risk()
                     # 에이전트 일별 리셋 (GAP-06: 오버나이트 포지션 holdings 전달)
                     self.coordinator.reset_daily(current_holdings=self.strategy.holdings)
+                    self.strategy.reset_daily()
                 else:
                     logger.info("휴장일이므로 07:00 시장 리스크 평가를 건너뜁니다.")
 
@@ -967,10 +968,17 @@ class AsyncAutoTrader:
         except Exception:
             pass  # 동기화 실패해도 로컬 holdings로 진행
 
+        # 매도 차단(거래정지/매매불가) 종목은 청산 판단 대상에서 제외한다.
+        # exit()이 무조건 None을 반환하므로 신호만 10초마다 영구 반복되던 원인.
+        blocked = getattr(self.strategy, "_unsellable_tickers", set())
+        sellable = {t: h for t, h in self.strategy.holdings.items() if t not in blocked}
+        if not sellable:
+            return
+
         # ── 에이전트 청산 신호 수집 ──────────────────────────────────────────
         agent_sell_set: set = set()
         try:
-            sell_decisions = await self.coordinator.generate_sell_decisions(self.strategy.holdings)
+            sell_decisions = await self.coordinator.generate_sell_decisions(sellable)
             for d in sell_decisions:
                 if d.ticker:
                     agent_sell_set.add(d.ticker)
@@ -979,7 +987,7 @@ class AsyncAutoTrader:
             logger.debug(f"에이전트 청산 신호 오류: {e}")
 
         regime = self._get_current_market_regime()
-        for ticker in list(self.strategy.holdings.keys()):
+        for ticker in list(sellable.keys()):
             try:
                 # 기존 전략 청산 조건 체크 (체제별 손익비 적용)
                 should_exit, reason = await self.strategy.check_exit_condition(ticker, market_regime=regime)

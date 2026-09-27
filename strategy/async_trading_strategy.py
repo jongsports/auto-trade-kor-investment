@@ -32,6 +32,17 @@ class AsyncTradingStrategy:
     def set_candidate_stocks(self, candidate_stocks):
          self.candidate_stocks = candidate_stocks
 
+    def reset_daily(self):
+         """일별 초기화.
+
+         거래정지는 해제될 수 있으므로 매도 차단 목록을 비운다. 비우지 않으면
+         컨테이너가 수주간 떠 있는 동안 영구 차단이 되어 포지션이 holdings에
+         남은 채 투자 비율만 잠식한다.
+         """
+         if self._unsellable_tickers:
+              logger.info(f"[일별초기화] 매도 차단 해제: {sorted(self._unsellable_tickers)}")
+              self._unsellable_tickers.clear()
+
     async def update_holdings(self):
          async with self._holdings_lock:
              await self._update_holdings_inner()

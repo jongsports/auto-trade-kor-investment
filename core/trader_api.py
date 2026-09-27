@@ -573,7 +573,9 @@ class AsyncKisAPI:
             msg_cd = res.get("msg_cd", "")
             logger.error(f"[매도실패] {ticker} {quantity}주 | msg_cd={msg_cd} | {msg1}")
             # 거래정지/매매불가 에러 표시 (재시도 방지용)
-            unsellable_codes = {"APBK0066", "APBK0919", "APBK0033"}
+            # APBK0919(장운영일자 상이)는 세션 경계에서 나는 일시적 오류이므로 제외한다.
+            # 영구 차단으로 분류하면 청산 신호만 무한 반복되고 3회 실패 강제제거가 발동하지 못한다.
+            unsellable_codes = {"APBK0066", "APBK0033"}
             if msg_cd in unsellable_codes or "거래정지" in msg1 or "매매불가" in msg1:
                 res["_unsellable"] = True
         return res
