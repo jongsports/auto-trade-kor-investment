@@ -51,6 +51,8 @@ class AsyncAutoTrader:
 
         # 청산 실패 연속 카운터 (ticker → 실패 횟수)
         self._exit_fail_counts: Dict[str, int] = {}
+        self._open_day_checked_for: Optional[str] = None  # KIS 개장일 조회 수행한 날짜
+        self._open_day_cache: Optional[bool] = None       # KIS 개장일 판정 결과
 
         # DB (ticker → buy_trade_id 매핑: 매수 저장 ID를 매도 시 연결)
         self.db = TradeDatabase()
@@ -193,6 +195,43 @@ class AsyncAutoTrader:
     # 다단계 동적 스크리닝 스케줄러 (issue #8)
     # ------------------------------------------------------------------ #
 
+    async def _confirm_open_day(self, now: datetime, local_guess: bool) -> bool:
+        """로컬 달력의 개장일 판정을 KIS 조회로 검증 (하루 1회).
+
+        holidays.json은 대체공휴일이 빠지기 쉽고, 배포 서버에서는 마운트된
+        파일이 기본 8일짜리 폴백만 들고 있었다. 그 결과 휴장일에 주문을 내다
+        APBK0919로 거부당하고 청산이 영구 차단된 사고가 있었다.
+        """
+        date_str = now.strftime("%Y%m%d")
+        if self._open_day_checked_for == date_str:
+            return self._open_day_cache if self._open_day_cache is not None else local_guess
+
+        if now.hour < 6:  # 야간 불필요 호출 방지
+            return local_guess
+
+        self._open_day_checked_for = date_str
+        try:
+            kis_open = await self.api_client.is_open_day(date_str)
+        except Exception as e:
+            logger.warning(f"[개장일검증] 조회 예외: {e}")
+            kis_open = None
+        self._open_day_cache = kis_open
+
+        if kis_open is None:
+            return local_guess
+        if kis_open != local_guess:
+            logger.warning(
+                f"[개장일검증] 불일치 {date_str}: 로컬={local_guess} KIS={kis_open} "
+                f"→ KIS 기준 적용. holidays.json 갱신 필요"
+            )
+            await self.notifier.send_message(
+                f"⚠️ <b>개장일 판정 불일치</b> {date_str}\n"
+                f"로컬 달력: {'개장' if local_guess else '휴장'} / "
+                f"KIS: {'개장' if kis_open else '휴장'}\n"
+                f"KIS 기준으로 진행합니다. holidays.json 갱신이 필요합니다."
+            )
+        return kis_open
+
     async def _scheduled_morning_routine(self):
         """다단계 동적 스크리닝 스케줄러.
 
@@ -214,8 +253,8 @@ class AsyncAutoTrader:
 
             # 휴장일(주말/공휴일) 판단
             # 단, 토큰 갱신(07:30)은 주말에도 수행할 수 있도록 조건 분리
-            from utils.utils import is_market_open
-            market_is_open_today = is_market_open()
+            from utils.utils import is_trading_day
+            market_is_open_today = await self._confirm_open_day(now, is_trading_day())
 
             # 06:00 — 자동 파라미터 최적화 (토요일 or 50거래 누적)
             if now_str == "06:00" and self._should_trigger("06:00_optimize"):
@@ -1072,6 +1111,22 @@ class AsyncAutoTrader:
                         err_msg = result.get("msg1", "unknown")
                         err_code = result.get("msg_cd", "")
                         logger.error(f"[청산실패] {ticker}: {err_code} {err_msg}")
+
+                        # APBK0919 = KIS 기준 장운영일자 불일치 → 우리 달력이 틀렸다.
+                        # 계속 주문을 시도하는 대신 당일 매매를 중단하고 경보한다.
+                        if err_code == "APBK0919":
+                            self._open_day_cache = False
+                            logger.error(
+                                "[개장일오류] KIS가 장운영일자 불일치를 반환 → "
+                                "당일 매매 중단. holidays.json 갱신 필요"
+                            )
+                            await self.notifier.send_message(
+                                f"🚨 <b>개장일 판정 오류</b>\n"
+                                f"{ticker} 주문이 APBK0919(장운영일자 상이)로 거부됨.\n"
+                                f"휴장일에 매매를 시도한 것으로 판단 → 당일 매매를 중단합니다.\n"
+                                f"holidays.json 갱신이 필요합니다."
+                            )
+                            return
 
                         self._exit_fail_counts[ticker] = self._exit_fail_counts.get(ticker, 0) + 1
                         fail_cnt = self._exit_fail_counts[ticker]

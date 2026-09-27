@@ -263,8 +263,24 @@ def calculate_strategy_performance(df, positions):
 # 거래 시간 관리 관련 유틸리티 함수
 
 
+def is_trading_day(date=None):
+    """오늘(또는 지정일)이 개장일인지 확인 — 시각은 보지 않는다.
+
+    is_market_open()은 09:00~15:30 시간대까지 검사하므로 "오늘 장이 열리는
+    날인가"를 물을 때 쓸 수 없다. 스케줄러가 이를 혼용해 07:00/08:00 단계가
+    항상 휴장일 분기로 빠지던 버그가 있었다.
+
+    Returns:
+        bool: 평일이고 공휴일이 아니면 True
+    """
+    d = date or datetime.now()
+    if d.weekday() >= 5:
+        return False
+    return d.strftime("%Y%m%d") not in load_holidays()
+
+
 def is_market_open():
-    """현재 시장이 열려있는지 확인
+    """현재 시장이 열려있는지 확인 (날짜 + 시각 모두 검사)
 
     Returns:
         bool: 시장 개장 여부

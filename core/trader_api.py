@@ -463,6 +463,37 @@ class AsyncKisAPI:
             }
         return None
         
+    async def is_open_day(self, date_str: str) -> Optional[bool]:
+        """KIS 국내휴장일조회로 해당 일자의 개장일 여부를 확인.
+
+        TR_ID: CTCA0903R. 로컬 holidays.json은 대체공휴일이 누락되기 쉬워
+        (배포 서버에서 기본 8일짜리 폴백만 들고 있던 사례) 휴장일에 주문을
+        내다 APBK0919로 거부당했다. 개장일 판정의 권위 있는 출처는 KIS다.
+
+        KIS 지침상 1일 1회 호출 권장이므로 호출부에서 하루 1회만 사용한다.
+
+        Returns:
+            True/False, 조회 실패 시 None (호출부가 로컬 달력으로 폴백)
+        """
+        params = {
+            "BASS_DT": date_str,
+            "CTX_AREA_FK": "",
+            "CTX_AREA_NK": "",
+        }
+        res = await self._fetch(
+            "GET", "/uapi/domestic-stock/v1/quotations/chk-holiday",
+            "CTCA0903R", params=params,
+        )
+        if res.get("rt_cd") != "0":
+            logger.warning(f"[휴장일조회] 실패 msg_cd={res.get('msg_cd')} {res.get('msg1')}")
+            return None
+
+        for row in res.get("output", []) or []:
+            if row.get("bass_dt") == date_str:
+                return row.get("opnd_yn") == "Y"
+        logger.warning(f"[휴장일조회] {date_str} 응답에 해당 일자 없음")
+        return None
+
     async def get_account_summary(self) -> Dict[str, Any]:
         """Get account balances efficiently."""
         params = {
