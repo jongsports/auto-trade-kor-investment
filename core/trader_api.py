@@ -58,6 +58,9 @@ class AsyncKisAPI:
         # 토큰 갱신 Lock (동시 갱신 방지)
         self._token_refresh_lock = asyncio.Lock()
 
+        # KIS 휴장일조회로 확인된 개장일 여부 {YYYYMMDD: bool}
+        self.open_day_calendar: Dict[str, bool] = {}
+
     async def init_session(self):
         """Initialize aiohttp session."""
         if self.session is None or self.session.closed:
@@ -86,7 +89,11 @@ class AsyncKisAPI:
             "appkey": self.app_key,
             "appsecret": self.app_secret,
         }
-        res = requests.post(url, headers=headers, json=data)
+        try:
+            res = requests.post(url, headers=headers, json=data, timeout=(5, 10))
+        except requests.RequestException as e:
+            logger.error(f"Failed to connect to KIS API: {type(e).__name__}")
+            return False
         if res.status_code == 200:
             res_data = res.json()
             self.access_token = res_data["access_token"]
@@ -147,12 +154,18 @@ class AsyncKisAPI:
             "custtype": "P",
         }
 
-    async def _fetch(self, method: str, path: str, tr_id: str, **kwargs) -> dict:
+    async def _fetch(self, method: str, path: str, tr_id: str, *,
+                     resend_on_error: bool = True, **kwargs) -> dict:
         """Helper to make an async API request with rate limiting and retries.
 
         Issue #11: demo 모드 1.1s 쿨다운을 finally 블록으로 이동하여
         성공/HTTP에러/네트워크예외 모든 경로에서 쿨다운 보장.
         세마포어와 슬라이딩 윈도우 레이트 리미터를 결합하여 TPS 버스트 원천 차단.
+
+        resend_on_error=False (주문 TR): 전송 후 네트워크 예외가 나면 KIS가 주문을
+        접수했는지 알 수 없다. 재전송하면 같은 시장가 주문이 중복 체결될 수 있으므로
+        재시도하지 않고 `_unconfirmed` 로 반환한다. TPS 초과·토큰 만료는 KIS가 명시적으로
+        거부한 응답이므로 재전송해도 안전하다.
         """
         if not self.is_connected:
             self.connect()
@@ -174,6 +187,7 @@ class AsyncKisAPI:
                     try:
                         await self._wait_rate_limit()
                         headers = self.get_headers(tr_id)
+                        token_used = self.access_token
                         async with self.session.request(method, url, headers=headers, **kwargs) as response:
                             # KIS sometimes returns JSON error bodies even on 500
                             if response.status == 500:
@@ -205,11 +219,14 @@ class AsyncKisAPI:
                                     or res_data.get("message") in ["EGW00123", "EGW00121"]):
                                 logger.warning("토큰 만료 감지 — 비동기 갱신 중...")
                                 async with self._token_refresh_lock:
-                                    # 다른 코루틴이 이미 갱신했는지 확인
-                                    if self.token_expire_time and datetime.now() < self.token_expire_time:
+                                    # 거부당한 토큰이 아직 현재 토큰이면 재발급한다. 로컬 만료시각은
+                                    # 실제와 어긋날 수 있어(다른 곳에서 재발급 등) 판단 근거로 쓰지 않는다.
+                                    if self.access_token != token_used:
                                         logger.info("토큰이 이미 갱신됨 — 건너뜀")
-                                    else:
-                                        await asyncio.to_thread(self._sync_init)
+                                    elif not await asyncio.to_thread(self._sync_init):
+                                        logger.error("토큰 재발급 실패")
+                                        return {"rt_cd": "-1", "msg_cd": "TOKEN_REFRESH_FAILED",
+                                                "msg1": "Token refresh failed"}
                                 continue
 
                             async with self._cb_lock:
@@ -218,7 +235,15 @@ class AsyncKisAPI:
                             return res_data
 
                     except Exception as e:
-                        logger.error(f"Request exception (attempt {attempt+1}/{max_retries}) tr_id={tr_id}: {e}")
+                        # 예외 메시지에는 계좌번호가 든 URL 쿼리가 섞여 있어 타입만 남긴다.
+                        logger.error(
+                            f"Request exception (attempt {attempt+1}/{max_retries}) "
+                            f"tr_id={tr_id}: {type(e).__name__}"
+                        )
+                        if not resend_on_error:
+                            return {"rt_cd": "-1", "msg_cd": "UNCONFIRMED",
+                                    "msg1": f"응답 미수신({type(e).__name__}) — 접수 여부 미확인",
+                                    "_unconfirmed": True}
                         if attempt < max_retries - 1:
                             await asyncio.sleep(1.0)
 
@@ -257,6 +282,18 @@ class AsyncKisAPI:
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
 
+    _CACHE_MAX_ENTRIES = 600
+    _CACHE_MAX_AGE_SECONDS = 1800
+
+    def _cache_put(self, cache: Dict[str, Any], key: str, value: Any) -> None:
+        """캐시에 넣되, 상한을 넘으면 최장 TTL(30분)이 지난 항목을 버린다."""
+        now = datetime.now()
+        if len(cache) >= self._CACHE_MAX_ENTRIES:
+            for k in [k for k, (_, t) in cache.items()
+                      if (now - t).total_seconds() > self._CACHE_MAX_AGE_SECONDS]:
+                del cache[k]
+        cache[key] = (value, now)
+
     async def get_ohlcv(self, ticker: str, period_code: str = "D", count: int = 100) -> pd.DataFrame:
         """Fetch historical price data asynchronously."""
         # TTL 캐시 조회 (Issue #10-E): 장중 5분, 장외 1시간
@@ -278,6 +315,20 @@ class AsyncKisAPI:
                 ttl = 1800
             if (now - cached_time).total_seconds() < ttl:
                 return cached_df
+
+        # FHKST01010400 은 요청 범위와 무관하게 최근 30행만 준다. 그보다 긴 구간이
+        # 필요한 호출(MA60, MACD 26/9, ADX 등)은 1회 100행을 주는 FHKST03010100 을 쓴다.
+        if period_code == "D" and count > 30:
+            end_dt = datetime.now()
+            start_dt = end_dt - timedelta(days=int(count * 1.6) + 20)
+            df = await self.get_ohlcv_by_range(
+                ticker, start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d"),
+                period_code="D", quiet=True,
+            )
+            if not df.empty:
+                df = df.tail(count).reset_index(drop=True)
+                self._cache_put(self._ohlcv_cache, cache_key, df)
+            return df
 
         # Calculate dates — 2년치 동적 범위 (Issue #10-C)
         end_date = datetime.now()
@@ -338,7 +389,7 @@ class AsyncKisAPI:
                     
             df["date"] = pd.to_datetime(df["date"], format="%Y%m%d", errors="coerce")
             df = df.sort_values("date").tail(count).reset_index(drop=True)
-            self._ohlcv_cache[cache_key] = (df, datetime.now())
+            self._cache_put(self._ohlcv_cache, cache_key, df)
             return df
         else:
             # rt_cd != "0" 이거나 data_list가 None인 경우만 에러
@@ -358,6 +409,7 @@ class AsyncKisAPI:
         end_date: str,
         period_code: str = "D",
         market_code: str = "J",
+        quiet: bool = False,
     ) -> pd.DataFrame:
         """
         날짜 범위 지정 OHLCV 수집 (TR: FHKST03010100).
@@ -389,8 +441,8 @@ class AsyncKisAPI:
         end_dt = datetime.strptime(end_date, "%Y%m%d")
         all_frames: List[pd.DataFrame] = []
 
-        # 100일 청크 단위로 분할 (영업일 기준 약 70일 = 달력 100일)
-        chunk_days = 100
+        # 1회 응답 상한이 100행이므로 달력 140일(영업일 약 95일) 단위로 분할
+        chunk_days = 140
         chunk_end = end_dt
         while chunk_end >= start_dt:
             chunk_start = max(start_dt, chunk_end - timedelta(days=chunk_days))
@@ -408,7 +460,7 @@ class AsyncKisAPI:
                 "FHKST03010100",
                 params=params,
             )
-            data_list = res.get("output2")
+            data_list = [r for r in (res.get("output2") or []) if r.get("stck_bsop_date")]
             if res.get("rt_cd") == "0" and data_list:
                 df_chunk = pd.DataFrame(data_list)
                 df_chunk.rename(columns=col_map, inplace=True)
@@ -429,7 +481,7 @@ class AsyncKisAPI:
                 break
 
         if not all_frames:
-            logger.error(f"[{ticker}] get_ohlcv_by_range: 수집된 데이터 없음")
+            (logger.debug if quiet else logger.error)(f"[{ticker}] get_ohlcv_by_range: 수집된 데이터 없음")
             return pd.DataFrame()
 
         result = (
@@ -438,7 +490,8 @@ class AsyncKisAPI:
             .sort_values("date")
             .reset_index(drop=True)
         )
-        logger.info(f"[{ticker}] get_ohlcv_by_range: {len(result)}행 수집 ({start_date}~{end_date})")
+        if not quiet:
+            logger.info(f"[{ticker}] get_ohlcv_by_range: {len(result)}행 수집 ({start_date}~{end_date})")
         return result
 
     async def get_current_price(self, ticker: str) -> Optional[Dict[str, Any]]:
@@ -470,7 +523,8 @@ class AsyncKisAPI:
         (배포 서버에서 기본 8일짜리 폴백만 들고 있던 사례) 휴장일에 주문을
         내다 APBK0919로 거부당했다. 개장일 판정의 권위 있는 출처는 KIS다.
 
-        KIS 지침상 1일 1회 호출 권장이므로 호출부에서 하루 1회만 사용한다.
+        KIS 지침상 1일 1회 호출 권장이므로 호출부에서 호출 빈도를 제한한다.
+        응답에는 기준일부터 약 3주치가 들어 있어 `open_day_calendar` 에 함께 저장한다.
 
         Returns:
             True/False, 조회 실패 시 None (호출부가 로컬 달력으로 폴백)
@@ -493,8 +547,10 @@ class AsyncKisAPI:
         if isinstance(rows, dict):
             rows = [rows]
         for row in rows:
-            if isinstance(row, dict) and row.get("bass_dt") == date_str:
-                return row.get("opnd_yn") == "Y"
+            if isinstance(row, dict) and row.get("bass_dt") and row.get("opnd_yn") in ("Y", "N"):
+                self.open_day_calendar[row["bass_dt"]] = row["opnd_yn"] == "Y"
+        if date_str in self.open_day_calendar:
+            return self.open_day_calendar[date_str]
         logger.warning(f"[휴장일조회] {date_str} 응답에 해당 일자 없음")
         return None
 
@@ -524,31 +580,56 @@ class AsyncKisAPI:
             # KIS output1 필드명을 내부 표준 필드명으로 정규화
             positions = []
             for p in raw_positions:
-                qty = int(p.get("hldg_qty", 0) or 0)
+                qty = self._to_int(p.get("hldg_qty"))
                 if qty <= 0:
                     continue  # 보유수량 0인 종목 제외
                 positions.append({
                     "ticker": p.get("pdno", ""),
                     "name": p.get("prdt_name", ""),
                     "quantity": qty,
-                    "buy_price": float(p.get("pchs_avg_pric", 0) or 0),
-                    "current_price": int(p.get("prpr", 0) or 0),
-                    "eval_profit_loss": int(p.get("evlu_pfls_amt", 0) or 0),
+                    # 미체결 매도 주문이 걸려 있으면 보유수량보다 작다 (0이면 전량 주문 중)
+                    "sellable_quantity": self._to_int(p.get("ord_psbl_qty"), default=qty),
+                    "buy_price": self._to_float(p.get("pchs_avg_pric")),
+                    "current_price": self._to_int(p.get("prpr")),
+                    "eval_profit_loss": self._to_int(p.get("evlu_pfls_amt")),
                 })
 
-            # 예수금, D+2 정산금, CMA 평가금액 중 가장 큰 값을 가용예산으로 사용
-            dnca = int(summary.get("dnca_tot_amt", 0))
-            prvs = int(summary.get("prvs_rcdl_excc_amt", 0))
-            cma = int(summary.get("cma_evlu_amt", 0))
-            available = max(dnca, prvs, cma)
+            # 예수금총액(dnca)은 D+2 결제 전까지 당일 매수분이 빠지지 않는다. 당일 매수를
+            # 반영하는 D+2 예수금(prvs)과 비교해 작은 쪽을 쓴다. 둘 다 0이면 CMA 계좌.
+            dnca = self._to_int(summary.get("dnca_tot_amt"))
+            prvs = self._to_int(summary.get("prvs_rcdl_excc_amt"))
+            cma = self._to_int(summary.get("cma_evlu_amt"))
+            cash_candidates = [v for v in (dnca, prvs) if v > 0]
+            available = min(cash_candidates) if cash_candidates else cma
 
             return {
-                "total_evaluated_amount": int(summary.get("tot_evlu_amt", 0)),
+                "total_evaluated_amount": self._to_int(summary.get("tot_evlu_amt")),
                 "available_amount": available,
                 "positions": positions
             }
 
+        # 조회 실패. 빈 dict 는 "보유 없음"이 아니라 "알 수 없음"이다 — 호출부는 매수를 막아야 한다.
+        logger.warning(f"[잔고조회] 실패 msg_cd={res.get('msg_cd')} {res.get('msg1')}")
         return {}
+
+    @staticmethod
+    def _to_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _order_no(res: Dict[str, Any]) -> str:
+        out = res.get("output") or {}
+        return out.get("ODNO") or out.get("odno") or ""
 
     async def market_buy(self, ticker: str, quantity: int) -> Dict[str, Any]:
         """시장가 매수 주문.
@@ -570,9 +651,10 @@ class AsyncKisAPI:
             "/uapi/domestic-stock/v1/trading/order-cash",
             tr_id,
             json=body,
+            resend_on_error=False,
         )
         if res.get("rt_cd") == "0":
-            logger.info(f"[매수완료] {ticker} {quantity}주 | 주문번호: {res.get('output', {}).get('odno', '')}")
+            logger.info(f"[매수완료] {ticker} {quantity}주 | 주문번호: {self._order_no(res)}")
         else:
             msg1 = res.get("msg1", "")
             msg_cd = res.get("msg_cd", "")
@@ -600,16 +682,17 @@ class AsyncKisAPI:
             "/uapi/domestic-stock/v1/trading/order-cash",
             tr_id,
             json=body,
+            resend_on_error=False,
         )
         if res.get("rt_cd") == "0":
-            logger.info(f"[매도완료] {ticker} {quantity}주 | 주문번호: {res.get('output', {}).get('odno', '')}")
+            logger.info(f"[매도완료] {ticker} {quantity}주 | 주문번호: {self._order_no(res)}")
         else:
             msg1 = res.get("msg1", "")
             msg_cd = res.get("msg_cd", "")
             logger.error(f"[매도실패] {ticker} {quantity}주 | msg_cd={msg_cd} | {msg1}")
             # 거래정지/매매불가 에러 표시 (재시도 방지용)
-            # APBK0919(장운영일자 상이)는 세션 경계에서 나는 일시적 오류이므로 제외한다.
-            # 영구 차단으로 분류하면 청산 신호만 무한 반복되고 3회 실패 강제제거가 발동하지 못한다.
+            # APBK0919(장운영일자 상이)는 휴장일에 주문했을 때 나는 오류로 종목 문제가 아니다.
+            # 종목 단위 차단으로 분류하면 개장일이 되어도 그 종목만 계속 못 판다.
             unsellable_codes = {"APBK0066", "APBK0033"}
             if msg_cd in unsellable_codes or "거래정지" in msg1 or "매매불가" in msg1:
                 res["_unsellable"] = True
@@ -648,12 +731,16 @@ class AsyncKisAPI:
                 params={"MKSC_SHRN_ISCD": ticker}
             )
             if res.get("rt_cd") == "0" and res.get("output2"):
-                frgn = sum(int(r.get("frgn_fake_ntby_qty", 0) or 0) for r in res["output2"])
-                orgn = sum(int(r.get("orgn_fake_ntby_qty", 0) or 0) for r in res["output2"])
+                # 각 행은 입력 시각까지의 누계다. 합산하면 최대 5배 과대 계상되므로
+                # 입력구분(bsop_hour_gb)이 가장 큰 최신 행 하나만 쓴다.
+                latest = max(res["output2"], key=lambda r: self._to_int(r.get("bsop_hour_gb")))
+                frgn = self._to_int(latest.get("frgn_fake_ntby_qty"))
+                orgn = self._to_int(latest.get("orgn_fake_ntby_qty"))
                 if frgn != 0 or orgn != 0:
                     logger.debug(f"[수급-추정] {ticker} | 외국인:{frgn:+,} 기관:{orgn:+,}")
-                    result = {"foreign_net_buy": frgn, "institution_net_buy": orgn, "prgrm_net_buy": 0}
-                    self._trend_cache[cache_key] = (result, datetime.now())
+                    result = {"foreign_net_buy": frgn, "institution_net_buy": orgn,
+                              "prgrm_net_buy": 0, "source": "estimate"}
+                    self._cache_put(self._trend_cache, cache_key, result)
                     return result
         except Exception as e:
             logger.warning(f"investor-trend-estimate 실패 {ticker}: {e}")
@@ -668,13 +755,21 @@ class AsyncKisAPI:
             )
             if res.get("rt_cd") == "0" and res.get("output"):
                 output = res["output"]
-                row = output[0] if isinstance(output, list) and len(output) > 0 else output
-                frgn = int(row.get("frgn_ntby_qty", 0) or 0)
-                orgn = int(row.get("orgn_ntby_qty", 0) or 0)
-                logger.debug(f"[수급-확정] {ticker}({market_code}) | 외국인:{frgn:+,} 기관:{orgn:+,}")
-                result = {"foreign_net_buy": frgn, "institution_net_buy": orgn, "prgrm_net_buy": 0}
-                self._trend_cache[cache_key] = (result, datetime.now())
-                return result
+                rows = output if isinstance(output, list) else [output]
+                # 장중에는 당일 행이 값 없이 내려온다. 값이 채워진 가장 최근 확정일을 쓴다.
+                row = next((r for r in rows
+                            if str(r.get("frgn_ntby_qty") or "").strip()
+                            or str(r.get("orgn_ntby_qty") or "").strip()), None)
+                if row is not None:
+                    frgn = self._to_int(row.get("frgn_ntby_qty"))
+                    orgn = self._to_int(row.get("orgn_ntby_qty"))
+                    logger.debug(f"[수급-확정] {ticker}({market_code}) {row.get('stck_bsop_date')} "
+                                 f"| 외국인:{frgn:+,} 기관:{orgn:+,}")
+                    result = {"foreign_net_buy": frgn, "institution_net_buy": orgn,
+                              "prgrm_net_buy": 0, "source": "confirmed",
+                              "as_of": row.get("stck_bsop_date", "")}
+                    self._cache_put(self._trend_cache, cache_key, result)
+                    return result
         except Exception as e:
             logger.warning(f"inquire-investor 폴백 실패 {ticker}: {e}")
 
@@ -808,24 +903,35 @@ class AsyncKisAPI:
             logger.warning(f"[MarketFlow] {mkt} 조회 실패: {e}")
             return {"market": mkt, "data_available": False}
 
-    async def get_top_market_stocks(self, market_code="0001", count=200) -> List[str]:
-        """
-        국내주식 거래대금 상위 종목 조회 (FHPST01710000)
-        market_code: '0001' (KOSPI), '1001' (KOSDAQ)
-        거래대금이 높은 종목 리스트를 반환합니다. 실전 투자에서는 전체 시장 중 활발한 종목 위주로 매매하는 것이 유리합니다.
-        """
-        params = {
-            "FID_COND_MRKT_DIV_CODE": "J", # 주식
-            "FID_COND_SCR_DIV_CODE": "20171", # 화면번호
-            "FID_INPUT_ISCD": market_code, # '0001' 코스피, '1001' 코스닥
-            "FID_DIV_CLS_CODE": "0", # 0:전체
-            "FID_BLNG_CLS_CODE": "0", # 0:전체
-            "FID_TRGT_CLS_CODE": "111111111", # 타겟 전체
-            "FID_TRGT_EXLS_CLS_CODE": "000000000", # 제외 전체
-            "FID_INPUT_PRICE_1": "",
-            "FID_INPUT_PRICE_2": "",
-            "FID_VOL_CNT": "",
+    # 순위분석 제외 코드 (10자리): 투자위험/경고/주의, 관리종목, 정리매매, 불성실공시,
+    # 우선주, 거래정지, ETF, ETN, 신용주문불가, SPAC. 신용주문불가만 허용(현금 매매라 무관).
+    _RANK_EXCLUDE = "1111111101"
+
+    def _rank_params(self, market_code: str, sort_code: str,
+                     min_price: int, max_price: int, min_volume: int) -> Dict[str, str]:
+        return {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_SCR_DIV_CODE": "20171",
+            "FID_INPUT_ISCD": market_code,      # '0001' 코스피, '1001' 코스닥
+            "FID_DIV_CLS_CODE": "1",            # 보통주
+            "FID_BLNG_CLS_CODE": sort_code,     # 0 평균거래량, 1 거래증가율, 3 거래금액순
+            "FID_TRGT_CLS_CODE": "111111111",
+            "FID_TRGT_EXLS_CLS_CODE": self._RANK_EXCLUDE,
+            "FID_INPUT_PRICE_1": str(min_price) if min_price else "",
+            "FID_INPUT_PRICE_2": str(max_price) if max_price else "",
+            "FID_VOL_CNT": str(min_volume) if min_volume else "",
+            "FID_INPUT_DATE_1": "",
         }
+
+    async def get_top_market_stocks(self, market_code="0001", count=30,
+                                    min_price: int = 0, max_price: int = 0) -> List[str]:
+        """거래대금 상위 종목 조회 (FHPST01710000, 1회 최대 30건).
+
+        market_code: '0001' (KOSPI), '1001' (KOSDAQ)
+        max_price: 계좌 규모로 살 수 있는 가격 상한. 살 수 없는 종목을 후보에 넣으면
+        스크리닝 API 호출만 쓰고 진입 단계에서 전부 탈락한다.
+        """
+        params = self._rank_params(market_code, "3", min_price, max_price, 0)
         
         # This TR is slightly different and common for quotation rankings
         res = await self._fetch("GET", "/uapi/domestic-stock/v1/quotations/volume-rank", "FHPST01710000", params=params)
@@ -840,24 +946,14 @@ class AsyncKisAPI:
                 
         return tickers[:count]
 
-    async def get_volume_surge_stocks(self, market_code="0001", count=20) -> List[str]:
-        """Issue #24-H1: 거래량 급증 종목 조회 (전일 대비 거래량 급증 순).
+    async def get_volume_surge_stocks(self, market_code="0001", count=20,
+                                      min_price: int = 2000, max_price: int = 0) -> List[str]:
+        """Issue #24-H1: 거래량 급증 종목 조회 (거래증가율 순).
 
-        기존 get_top_market_stocks()는 거래대금 상위이므로 대형주 편향.
-        이 메서드는 거래량 급증률 순 정렬로 당일 테마/급등 종목을 포착.
+        get_top_market_stocks()는 거래대금 상위이므로 대형주 편향.
+        이 메서드는 거래증가율 순 정렬로 당일 테마/급등 종목을 포착.
         """
-        params = {
-            "FID_COND_MRKT_DIV_CODE": "J",
-            "FID_COND_SCR_DIV_CODE": "20171",
-            "FID_INPUT_ISCD": market_code,
-            "FID_DIV_CLS_CODE": "0",
-            "FID_BLNG_CLS_CODE": "0",
-            "FID_TRGT_CLS_CODE": "111111111",
-            "FID_TRGT_EXLS_CLS_CODE": "000000000",
-            "FID_INPUT_PRICE_1": "1000",   # 최소 1,000원 (저가주 제외)
-            "FID_INPUT_PRICE_2": "",
-            "FID_VOL_CNT": "50000",         # 최소 거래량 5만주
-        }
+        params = self._rank_params(market_code, "1", min_price, max_price, 50000)
         try:
             res = await self._fetch(
                 "GET", "/uapi/domestic-stock/v1/quotations/volume-rank",
