@@ -8,6 +8,9 @@ services:
     container_name: kor-trade-live
     restart: unless-stopped
     network_mode: host
+    # 파이썬이 PID 1 이면 SIGTERM 기본 처리가 무시된다. init 이 신호를 전달한다.
+    init: true
+    stop_grace_period: 40s
 
     env_file:
       - .env
@@ -24,6 +27,8 @@ services:
       - /home/jongseung/kor-trade-data/data/strategy_performance.json:/app/data/strategy_performance.json
       - /home/jongseung/kor-trade-data/data/strategy_stats.json:/app/data/strategy_stats.json
       - /home/jongseung/kor-trade-data/data/holidays.json:/app/data/holidays.json
+      # 포지션 메타데이터·확인된 개장일·일일 손익. 디렉터리째 마운트해야 원자적 교체가 된다.
+      - /home/jongseung/kor-trade-data/data/state:/app/data/state
 
     command: python main.py
 
@@ -49,6 +54,8 @@ services:
     container_name: kor-trade-demo
     restart: "no"
     network_mode: host
+    init: true
+    stop_grace_period: 40s
 
     env_file:
       - .env
@@ -65,6 +72,8 @@ services:
       - /home/jongseung/kor-trade-data/data/strategy_performance.json:/app/data/strategy_performance.json
       - /home/jongseung/kor-trade-data/data/strategy_stats.json:/app/data/strategy_stats.json
       - /home/jongseung/kor-trade-data/data/holidays.json:/app/data/holidays.json
+      # 포지션 메타데이터·확인된 개장일·일일 손익. 디렉터리째 마운트해야 원자적 교체가 된다.
+      - /home/jongseung/kor-trade-data/data/state:/app/data/state
 
     command: python main.py --demo
 

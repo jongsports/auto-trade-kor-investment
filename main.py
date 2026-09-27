@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import signal
 import sys
 
 from core.async_trader import AsyncAutoTrader
@@ -12,19 +13,39 @@ def parse_args():
     parser.add_argument("--demo", action="store_true", help="Run via VTS Demo Server")
     return parser.parse_args()
 
+async def run_until_signalled(trader: AsyncAutoTrader, logger: logging.Logger):
+    """SIGTERM/SIGINT 를 받으면 trader.stop() 으로 정리하고 끝낸다.
+
+    docker stop 과 재배포는 SIGTERM 을 보낸다. 핸들러가 없으면 PID 1 인 파이썬은
+    신호를 무시하다가 SIGKILL 로 죽어, 진행 중이던 주문의 기록이 남지 않는다.
+    """
+    loop = asyncio.get_running_loop()
+    stop_requested = asyncio.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop_requested.set)
+        except NotImplementedError:   # Windows
+            pass
+
+    run_task = asyncio.create_task(trader.start())
+    stop_task = asyncio.create_task(stop_requested.wait())
+    await asyncio.wait({run_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+
+    if stop_task.done():
+        logger.info("종료 신호 수신 — 정리 후 종료합니다.")
+        await trader.stop()
+    stop_task.cancel()
+    await asyncio.gather(run_task, stop_task, return_exceptions=True)
+
 async def main_async():
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     logger = logging.getLogger("main")
-    
+
     trader = AsyncAutoTrader(demo_mode=args.demo)
-    
+
     if args.mode == "run":
-        try:
-             await trader.start()
-        except KeyboardInterrupt:
-             logger.info("Gracefully shutting down...")
-             await trader.stop()
+        await run_until_signalled(trader, logger)
     elif args.mode == "once":
         logger.info("Once mode is executing setup and single screening...")
         trader.api_client.connect()

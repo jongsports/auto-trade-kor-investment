@@ -1,4 +1,5 @@
 .env
+.env.*
 *.env
 venv/
 .venv/
@@ -8,7 +9,10 @@ logs/
 *.log
 data/token.json
 data/backtest_cache/
+data/backtest_cache_sample/
 data/screening_results.json
+data/state/
+tests/__pycache__/
 backtest_results/
 .git/
 .github/

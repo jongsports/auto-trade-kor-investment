@@ -1,5 +1,7 @@
 # 환경변수 / 인증 정보 (절대 커밋 금지)
 .env
+.env.*
+!.env.example
 *.env
 
 # API 토큰 캐시
@@ -7,6 +9,7 @@ data/token.json
 
 # 백테스팅 캐시 (런타임 수집 데이터)
 data/backtest_cache/
+data/backtest_cache_sample/
 
 # Python 캐시
 __pycache__/
@@ -24,8 +27,13 @@ env/
 logs/
 *.log
 
-# 스크리닝 결과 (런타임 데이터)
+# 런타임 데이터
 data/screening_results.json
+data/state/
+data/near_miss_candidates.json
+data/foreign_streak.json
+data/strategy_performance.json
+data/strategy_stats.json
 backtest_results/
 
 # macOS

@@ -27,15 +27,19 @@ jobs:
         with:
           clean: false
 
-      - name: Python 문법 검사
-        run: |
-          python3 -m py_compile main.py
-          python3 -m py_compile config.py
-          python3 -m py_compile core/trader_api.py
-          python3 -m py_compile core/async_trader.py
-          python3 -m py_compile strategy/async_screener.py
-          python3 -m py_compile strategy/async_trading_strategy.py
-          echo "✅ 문법 검사 통과"
+      - name: 이미지 빌드
+        run: docker compose build
+
+      # 호스트 파이썬이 아니라 배포될 이미지 안에서 검사한다. 의존성 누락이나 import
+      # 오류는 py_compile 로는 잡히지 않는다.
+      - name: 전체 문법 검사
+        run: docker run --rm kor-trade:latest python -m compileall -q .
+
+      - name: 모듈 import 검사
+        run: docker run --rm kor-trade:latest python -c "import main, run_backtest"
+
+      - name: 단위 테스트 (네트워크 호출 없음)
+        run: docker run --rm kor-trade:latest python -m unittest discover -s tests -t .
 
   # ─── 2단계: 배포 ───────────────────────────────────────────
   deploy:
@@ -54,6 +58,18 @@ jobs:
           echo "📦 브랜치: ${{ github.ref_name }}"
           echo "📝 커밋: ${{ github.sha }}"
 
+      # 장중 재배포는 컨테이너를 재생성해 진행 중인 매매를 끊는다.
+      # 급한 수정은 workflow_dispatch 로 수동 실행하면 이 검사를 건너뛴다.
+      - name: 장중 배포 차단
+        if: github.event_name == 'push'
+        run: |
+          now=$(TZ=Asia/Seoul date +%H%M)
+          dow=$(TZ=Asia/Seoul date +%u)
+          if [ "$dow" -le 5 ] && [ "$now" -ge 0850 ] && [ "$now" -le 1535 ]; then
+            echo "❌ 장중(08:50~15:35)에는 자동 배포하지 않습니다. 장 마감 후 다시 실행하거나 수동 실행하세요."
+            exit 1
+          fi
+
       - name: .env 파일 생성 (GitHub Secrets → 파일)
         run: |
           printf "APP_KEY=%s\n" "${{ secrets.APP_KEY }}" > .env
@@ -67,12 +83,14 @@ jobs:
           printf "DB_NAME=%s\n" "${{ secrets.DB_NAME }}" >> .env
           printf "DB_USER=%s\n" "${{ secrets.DB_USER }}" >> .env
           printf "DB_PASSWORD=%s\n" "${{ secrets.DB_PASSWORD }}" >> .env
+          chmod 600 .env
           echo "✅ .env 생성 완료 ($(grep -c '=' .env)개 항목)"
 
       - name: 영구 데이터 디렉터리 및 파일 생성
         run: |
           mkdir -p /home/jongseung/kor-trade-data/logs
           mkdir -p /home/jongseung/kor-trade-data/data/backtest_cache
+          mkdir -p /home/jongseung/kor-trade-data/data/state
           touch /home/jongseung/kor-trade-data/data/token.json
           touch /home/jongseung/kor-trade-data/data/screening_results.json
           touch /home/jongseung/kor-trade-data/data/foreign_streak.json
@@ -90,10 +108,25 @@ jobs:
       - name: 사용하지 않는 이미지 정리
         run: docker image prune -f
 
+      # 기동 직후 크래시 루프여도 `up -d` 는 성공한다. 잠시 뒤 실제로 떠 있는지 본다.
       - name: 배포 상태 확인
         run: |
-          echo "✅ 배포 완료!"
+          sleep 45
           docker compose ps
+          status=$(docker inspect -f '{{.State.Status}}' kor-trade-live)
+          restarts=$(docker inspect -f '{{.RestartCount}}' kor-trade-live)
+          echo "status=$status restarts=$restarts"
+          if [ "$status" != "running" ] || [ "$restarts" -gt 0 ]; then
+            echo "❌ 컨테이너가 정상 기동하지 못했습니다."
+            docker logs --tail 80 kor-trade-live
+            exit 1
+          fi
+          if docker logs --since 45s kor-trade-live 2>&1 | grep -q "Traceback"; then
+            echo "❌ 기동 로그에 예외가 있습니다."
+            docker logs --tail 80 kor-trade-live
+            exit 1
+          fi
+          echo "✅ 배포 완료"
 
   # ─── 3단계: 결과 ───────────────────────────────────────────
   notify:
