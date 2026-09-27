@@ -247,7 +247,41 @@ class EntryTest(IsolatedStateTestCase):
         api.market_buy = AsyncMock(return_value={"rt_cd": "-1", "_unconfirmed": True})
         run(s.entry("005930", reason="Overnight"))
         self.assertTrue(s.holdings["005930"]["unconfirmed"])
-        self.assertEqual(s.order_history, [])
+        self.assertEqual(s.opened_positions, [])
+
+    def test_buy_is_confirmed_once_when_first_seen_at_broker(self):
+        s, api, _ = make_strategy(account())
+        run(s.entry("005930", reason="Overnight", score=82))
+        run(s.update_holdings())
+        self.assertEqual(s.opened_positions, [])                  # 아직 잔고에 없음
+        api.get_account_summary = AsyncMock(return_value=account(broker_pos(qty=3, buy=71_150.0)))
+        run(s.update_holdings())
+        run(s.update_holdings())
+        self.assertEqual(len(s.opened_positions), 1)
+        opened = s.opened_positions[0]
+        self.assertEqual((opened["buy_price"], opened["quantity"], opened["score"]), (71_150.0, 3, 82.0))
+
+    def test_adopted_positions_are_not_reported_as_bot_buys(self):
+        s, _, _ = make_strategy(account(broker_pos("000660")))
+        run(s.update_holdings())
+        self.assertEqual(s.opened_positions, [])
+
+    def test_rejected_order_raises_unfilled_alert_once(self):
+        s, _, _ = make_strategy(account())
+        run(s.entry("005930", reason="Overnight"))
+        s.holdings["005930"]["entry_time"] = datetime.now() - timedelta(minutes=5)
+        run(s.update_holdings())
+        run(s.update_holdings())
+        self.assertEqual([a["ticker"] for a in s.unfilled_alerts], ["005930"])
+        self.assertEqual(s.opened_positions, [])
+
+    def test_limit_up_price_blocks_market_buy(self):
+        s, api, _ = make_strategy()
+        api.get_current_price = AsyncMock(return_value={"price": 19_860, "upper_limit": 19_860})
+        res = run(s.entry("030530", reason="Overnight"))
+        self.assertTrue(res["_rejected"])
+        self.assertIn("상한가", res["msg1"])
+        api.market_buy.assert_not_awaited()
 
     def test_concurrent_entries_for_same_ticker_buy_once(self):
         # 스케줄러와 모니터 루프가 같은 분에 같은 종목으로 진입하는 경우

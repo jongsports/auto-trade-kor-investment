@@ -104,6 +104,21 @@ class AsyncAutoTrader:
         except Exception as e:
             logger.error(f"잔고 동기화 오류: {e}")
             return False
+        opened, self.strategy.opened_positions = self.strategy.opened_positions, []
+        for info in opened:
+            try:
+                await self._on_position_opened(info)
+            except Exception as e:
+                logger.error(f"매수 확정 기록 오류 {info.get('ticker')}: {e}", exc_info=True)
+
+        unfilled, self.strategy.unfilled_alerts = self.strategy.unfilled_alerts, []
+        for info in unfilled:
+            await self.notifier.send_message(
+                f"⚠️ <b>매수 미체결</b> {info.get('name', info['ticker'])} ({info['ticker']})\n"
+                f"주문은 접수됐지만 잔고에 잡히지 않았습니다 (거부 또는 미체결).\n"
+                f"오늘은 이 종목을 다시 매수하지 않습니다."
+            )
+
         closed, self.strategy.closed_positions = self.strategy.closed_positions, []
         for info in closed:
             try:
@@ -923,42 +938,14 @@ class AsyncAutoTrader:
                 continue
 
             try:
-                result = await self.strategy.entry(ticker, reason=reason, name=name)
+                result = await self.strategy.entry(
+                    ticker, reason=reason, name=name, score=float(c.get("score", 0)))
                 if result.get("rt_cd") == "0":
+                    # 접수만 된 상태다. DB 기록과 체결 알림은 잔고에서 확인된 뒤에 한다
+                    # (상한가 종목의 시장가 매수는 접수 후 거부된다).
                     holding = self.strategy.holdings.get(ticker, {})
-                    score = c.get("score", 0)
-                    gap = c.get("opening_gap", None)
-                    gap_str = f" | 갭: {gap:+.2%}" if gap is not None else ""
-                    buy_price = holding.get("buy_price", 0)
-                    filled_qty = holding.get("quantity", 0)
-                    invest_amt = int(float(buy_price) * filled_qty)
-
-                    await self.notifier.send_message(
-                        f"📈 <b>매수 주문 접수</b> {name} ({ticker})\n"
-                        f"전략: {reason} | 점수: {score:.1f}\n"
-                        f"기준가: {float(buy_price):,.0f}원 | 수량: {filled_qty}주{gap_str}\n"
-                        f"투자금: {invest_amt:,.0f}원"
-                    )
+                    logger.info(f"[매수접수] {ticker} {holding.get('quantity', 0)}주 — 체결 확인 대기")
                     success_tickers.append((name, ticker))
-                    if self.coordinator:
-                        try:
-                            self.coordinator.on_trade_executed(
-                                ticker=ticker, action="BUY", strategy=reason,
-                                price=float(buy_price), quantity=filled_qty,
-                            )
-                        except Exception as e:
-                            logger.warning(f"에이전트 매수 피드백 오류 {ticker}: {e}")
-
-                    trade_id = await self.db.save_trade_buy(
-                        ticker=ticker,
-                        name=name,
-                        price=float(buy_price),
-                        quantity=filled_qty,
-                        strategy=reason,
-                        score=float(score),
-                        market_regime=regime,
-                    )
-                    self.strategy.set_buy_trade_id(ticker, trade_id)
                 elif result.get("_rejected"):
                     rejected_tickers.append((name, ticker, result.get("msg1", "")))
                 elif result.get("_unconfirmed"):
@@ -1071,6 +1058,38 @@ class AsyncAutoTrader:
             )
             return False
         return await self._on_sell_failed(ticker, holding, result)
+
+    async def _on_position_opened(self, info: dict):
+        """잔고에 잡혀 체결이 확인된 매수의 기록·알림. 수량과 평단은 증권사 값이다."""
+        ticker = info["ticker"]
+        name = info.get("name", ticker)
+        qty, buy_price = info.get("quantity", 0), float(info.get("buy_price", 0))
+        strategy_name = info.get("reason", "Standard")
+
+        trade_id = await self.db.save_trade_buy(
+            ticker=ticker, name=name, price=buy_price, quantity=qty,
+            strategy=strategy_name, score=float(info.get("score") or 0),
+            market_regime=self._get_current_market_regime(),
+        )
+        self.strategy.set_buy_trade_id(ticker, trade_id)
+        self.strategy.order_history.append({
+            "action": "BUY", "ticker": ticker, "name": name, "quantity": qty,
+            "price": buy_price, "time": datetime.now().isoformat(), "reason": strategy_name,
+        })
+        await self.notifier.send_message(
+            f"📈 <b>매수 체결 확인</b> {name} ({ticker})\n"
+            f"전략: {strategy_name} | 점수: {float(info.get('score') or 0):.0f}\n"
+            f"체결가: {buy_price:,.0f}원 | 수량: {qty}주\n"
+            f"투자금: {buy_price * qty:,.0f}원"
+        )
+        if self.coordinator:
+            try:
+                self.coordinator.on_trade_executed(
+                    ticker=ticker, action="BUY", strategy=strategy_name,
+                    price=buy_price, quantity=qty,
+                )
+            except Exception as e:
+                logger.warning(f"에이전트 매수 피드백 오류 {ticker}: {e}")
 
     async def _on_position_closed(self, info: dict):
         """잔고에서 사라진 것이 확인된 청산의 손익 기록·알림.

@@ -144,6 +144,16 @@ class ProcessTickerTest(IsolatedStateTestCase):
         with freeze_time("strategy.async_screener", datetime(2026, 9, 28, 8, 0)):
             self.assertEqual(run(s._process_ticker("000001", "KOSPI"))["ticker"], "000001")
 
+    def test_limit_up_stock_is_excluded(self):
+        s, api = make_screener()
+        s.get_entry_threshold = lambda *_: 0
+        api.get_current_price = AsyncMock(return_value={**quote(price=13_000, high=13_000), "upper_limit": 13_000})
+        with freeze_time("strategy.async_screener", datetime(2026, 9, 28, 15, 10)):
+            self.assertEqual(run(s._process_ticker("000001", "KOSPI", is_overnight_window=True)), {})
+        api.get_current_price = AsyncMock(return_value={**quote(price=12_990, high=13_000), "upper_limit": 13_000})
+        with freeze_time("strategy.async_screener", datetime(2026, 9, 28, 15, 10)):
+            self.assertTrue(run(s._process_ticker("000001", "KOSPI", is_overnight_window=True)))
+
     def test_quote_failure_blocks_intraday_candidate(self):
         s, api = make_screener()
         api.get_current_price = AsyncMock(return_value=None)

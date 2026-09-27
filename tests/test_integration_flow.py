@@ -86,7 +86,8 @@ class FakeBroker(AsyncKisAPI):
             return {"rt_cd": "0", "output": {
                 "stck_prpr": str(p["price"]), "stck_oprc": str(p["open"]), "stck_hgpr": str(p["high"]),
                 "stck_lwpr": str(p["low"]), "acml_vol": str(p["volume"]),
-                "acml_tr_pbmn": str(p["price"] * p["volume"]), "prdy_ctrt": "1.0"}}
+                "acml_tr_pbmn": str(p["price"] * p["volume"]), "prdy_ctrt": "1.0",
+                "stck_mxpr": str(p.get("upper_limit", 0))}}
         if tr_id == "HHPTJ04160200":
             return {"rt_cd": "0", "output2": [
                 {"bsop_hour_gb": "4", "frgn_fake_ntby_qty": "5000", "orgn_fake_ntby_qty": "3000"},
@@ -114,6 +115,9 @@ class FakeBroker(AsyncKisAPI):
             side = "BUY" if tr_id == "TTTC0012U" else "SELL"
             self.orders.append((side, ticker, qty))
             if side == "BUY":
+                limit = self.prices[ticker].get("upper_limit", 0)
+                if limit and price >= limit:      # 상한가: 접수는 되지만 체결되지 않는다
+                    return {"rt_cd": "0", "output": {"ODNO": f"{len(self.orders):010d}"}}
                 if price * qty > self.cash:
                     return {"rt_cd": "1", "msg_cd": "APBK0952", "msg1": "주문가능금액을 초과"}
                 if not self.fill_buys:            # 접수만 되고 잔고에는 아직 안 잡힘
@@ -236,11 +240,16 @@ class OvernightRoundTripTest(IsolatedStateTestCase):
         self.assertLessEqual(len(broker.positions), config.MAX_STOCK_COUNT)
 
         ticker = sorted(bought)[0]
+        trader.db.save_trade_buy.assert_not_awaited()            # 아직 접수만 된 상태
+        with at(datetime(2026, 9, 28, 15, 10, 20)):
+            run(trader._check_exit_conditions())                 # 잔고에 잡힘 → 체결 확정
         info = trader.strategy.holdings[ticker]
         self.assertEqual(info["reason"], "Overnight")
         self.assertIsNotNone(info["buy_trade_id"])
         first_buy = trader.db.save_trade_buy.await_args_list[0].kwargs
         self.assertEqual(first_buy["name"], dict(broker.universe)[first_buy["ticker"]])
+        self.assertEqual(first_buy["price"], broker.positions[first_buy["ticker"]]["avg"])
+        self.assertGreater(first_buy["score"], 0)
 
         # ── 재배포: 새 프로세스가 같은 상태 디렉터리에서 기동 ──────────────
         restarted = build_trader(broker)
@@ -275,6 +284,7 @@ class OvernightRoundTripTest(IsolatedStateTestCase):
         trader = build_trader(broker)
         with at(MON_1510):
             run(trader._overnight_entry())
+            run(trader._check_exit_conditions())
         ticker = next(iter(broker.positions))
 
         restarted = build_trader(broker)
@@ -370,6 +380,27 @@ class OvernightRoundTripTest(IsolatedStateTestCase):
         info = trader.strategy.holdings[ticker]
         self.assertEqual(info["reason"], "Overnight")     # Standard 로 떨어지지 않는다
         self.assertEqual([o for o in broker.orders if o[0] == "SELL"], [])
+
+    def test_limit_up_stock_is_not_a_candidate(self):
+        # 실거래: LG씨엔에스·원익홀딩스 등 상한가 종목 매수 5건이 접수 후 거부됐다.
+        broker = self._broker()
+        broker.prices["000100"]["upper_limit"] = broker.prices["000100"]["price"]
+        trader = build_trader(broker)
+        with at(MON_1510):
+            run(trader._overnight_entry())
+        self.assertNotIn("000100", [t for _, t, _ in broker.orders])
+
+    def test_price_reaching_limit_after_screening_blocks_the_order(self):
+        broker = self._broker()
+        trader = build_trader(broker)
+        with at(MON_1510):
+            candidates = run(trader.screener.run_screening_async(["KOSPI"]))
+            self.assertTrue(candidates)
+            for t in broker.prices:
+                broker.prices[t]["upper_limit"] = broker.prices[t]["price"]
+            run(trader._execute_entries(candidates, context="오버나이트 진입"))
+        self.assertEqual(broker.orders, [])
+        self.assertTrue(any("상한가" in a for a in alerts(trader)), alerts(trader))
 
     def test_failed_price_history_blocks_candidates(self):
         broker = self._broker()

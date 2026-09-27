@@ -46,6 +46,8 @@ def make_trader(holdings=None, coordinator=None):
     st._unsellable_tickers = set()
     st.adopted_unknown = []
     st.closed_positions = []
+    st.opened_positions = []
+    st.unfilled_alerts = []
     st.order_history = []
     st.update_holdings = AsyncMock(return_value=True)
     st.open_tickers = lambda: [k for k, v in st.holdings.items()
@@ -276,7 +278,7 @@ class EntryFlowTest(IsolatedStateTestCase):
              {"ticker": "000002", "name": "나", "reason": "Overnight", "score": 70}]
 
     def _enter(self, t, st, results):
-        async def _entry(ticker, reason="", name=""):
+        async def _entry(ticker, reason="", name="", score=0.0):
             r = results[ticker]
             if r.get("rt_cd") == "0":
                 st.holdings[ticker] = holding(ticker=ticker, name=name, quantity=3, buy_price=10_000)
@@ -292,7 +294,30 @@ class EntryFlowTest(IsolatedStateTestCase):
         summary = t.notifier.send_message.await_args.args[0]
         self.assertIn("리스크 한도 1종목", summary)
         self.assertIn("주가가 예산 초과", summary)
+
+    def test_buy_is_recorded_only_after_broker_shows_the_position(self):
+        # 상한가 종목의 시장가 매수는 접수(rt_cd=0) 후 거부된다. 접수만으로 기록하면
+        # 존재하지 않는 매수가 DB 와 알림에 남는다 (실거래 5건).
+        t, st = make_trader()
+        self._enter(t, st, {"000001": {"rt_cd": "0"}, "000002": rejection("x")})
+        t.db.save_trade_buy.assert_not_awaited()
+        self.assertFalse(any("체결 확인" in c.args[0] for c in t.notifier.send_message.await_args_list))
+
+        st.opened_positions = [holding(ticker="000001", name="가", quantity=3, buy_price=10_050.0,
+                                       reason="Overnight", score=80.0)]
+        st.check_exit_condition = AsyncMock(return_value=(False, "Hold"))
+        run(t._check_exit_conditions())
+        kw = t.db.save_trade_buy.await_args.kwargs
+        self.assertEqual((kw["ticker"], kw["price"], kw["quantity"], kw["score"]), ("000001", 10_050.0, 3, 80.0))
         st.set_buy_trade_id.assert_called_once_with("000001", 77)
+        self.assertTrue(any("매수 체결 확인" in c.args[0] for c in t.notifier.send_message.await_args_list))
+
+    def test_unfilled_buy_is_announced(self):
+        t, st = make_trader()
+        st.unfilled_alerts = [holding(ticker="030530", name="원익홀딩스")]
+        run(t._check_exit_conditions())
+        self.assertIn("매수 미체결", t.notifier.send_message.await_args.args[0])
+        self.assertEqual(st.unfilled_alerts, [])
 
     def test_unconfirmed_buy_raises_alert(self):
         t, st = make_trader()

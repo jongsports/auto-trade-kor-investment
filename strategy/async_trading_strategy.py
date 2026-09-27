@@ -22,7 +22,7 @@ REBUY_COOLDOWN_SECONDS = 1800
 # 재시작 후에도 유지해야 하는 포지션 필드
 _PERSISTED_FIELDS = (
     "ticker", "name", "quantity", "buy_price", "high_price", "entry_time",
-    "reason", "stop_price", "buy_trade_id", "pending_sell", "origin", "seen_at_broker",
+    "reason", "stop_price", "buy_trade_id", "pending_sell", "origin", "seen_at_broker", "score",
 )
 
 PositionRecoverer = Callable[[str], Awaitable[Optional[dict]]]
@@ -53,6 +53,10 @@ class AsyncTradingStrategy:
         self.adopted_unknown: List[str] = []
         # 잔고에서 사라진 것이 확인된 청산 — trader 가 손익 기록·알림 후 비운다.
         self.closed_positions: List[dict] = []
+        # 잔고에 처음 잡힌(=체결이 확인된) 매수 — trader 가 DB 기록·알림 후 비운다.
+        self.opened_positions: List[dict] = []
+        # 접수됐지만 체결되지 않은 것으로 보이는 매수 — trader 가 알림 후 비운다.
+        self.unfilled_alerts: List[dict] = []
         # 매수 접수 후 유예 시간 안에 잔고에 잡히지 않은 주문. 늦게 체결되면 여기서
         # 메타데이터를 되찾고, 그동안 같은 종목을 다시 사지 않는다.
         self._unfilled_entries: Dict[str, dict] = self._load_entries("unfilled_entries")
@@ -167,7 +171,12 @@ class AsyncTradingStrategy:
               info["profit_loss"] = pos.get("eval_profit_loss", 0)
               info["high_price"] = max(info.get("high_price") or 0, info["current_price"])
               info.pop("unconfirmed", None)
-              info["seen_at_broker"] = True
+              if not info.get("seen_at_broker"):
+                   info["seen_at_broker"] = True
+                   if info.get("origin") == "bot":
+                        # 접수는 체결이 아니다. 잔고에 잡힌 지금이 매수가 확인된 시점이고,
+                        # 수량과 평단도 이제 실제 값이다.
+                        self.opened_positions.append(dict(info))
 
               pending = info.get("pending_sell")
               if pending and info["sellable_quantity"] > 0:
@@ -197,6 +206,7 @@ class AsyncTradingStrategy:
                    # 남겨 두고(늦게 잡히면 복원), 오늘은 같은 종목을 다시 사지 않는다.
                    logger.warning(f"[매수미체결] {ticker}: 접수 {age:.0f}초 후에도 잔고에 없음")
                    self._unfilled_entries[ticker] = info
+                   self.unfilled_alerts.append(dict(info))
                    continue
               logger.warning(f"[포지션소실] {ticker}: 잔고에 없음 — 외부 매도로 보고 제거")
 
@@ -209,7 +219,7 @@ class AsyncTradingStrategy:
          late = self._unfilled_entries.pop(ticker, None)
          if late:
               logger.warning(f"[매수체결확인] {ticker}: 유예 시간 이후 체결 — 메타데이터 복원")
-              return dict(late)
+              return {**late, "seen_at_broker": False}
 
          if self.position_recoverer is not None:
               try:
@@ -421,7 +431,7 @@ class AsyncTradingStrategy:
         return int(elapsed / 60) if elapsed < REBUY_COOLDOWN_SECONDS else None
 
     async def entry(self, ticker: str, quantity: int = 0, price: int = 0,
-                    reason: str = "Momentum", name: str = ""):
+                    reason: str = "Momentum", name: str = "", score: float = 0.0):
         """시장가 매수. 수량은 리스크 한도 안에서 정하며 quantity 는 상한으로만 쓴다.
 
         주문을 내지 않은 경우 `_rejected` 결과를 반환한다 (API 실패와 구분).
@@ -440,6 +450,9 @@ class AsyncTradingStrategy:
             current_price = price_data["price"] if price_data else 0
             if not current_price:
                 return self._reject(ticker, "현재가 조회 실패")
+            limit = price_data.get("upper_limit") or 0
+            if limit and current_price >= limit:
+                return self._reject(ticker, "상한가 — 시장가 매수 불가")
 
             local_positions = {
                 t: float(i.get("buy_price", 0)) * i.get("quantity", 0)
@@ -476,17 +489,10 @@ class AsyncTradingStrategy:
                     "pending_sell": None,
                     "origin": "bot",
                     "unconfirmed": not accepted,
+                    "seen_at_broker": False,
+                    "score": float(score),
                 }
                 self._persist()
-            if accepted:
-                self.order_history.append({
-                    "action": "BUY",
-                    "ticker": ticker,
-                    "quantity": buy_qty,
-                    "price": current_price,
-                    "time": datetime.now().isoformat(),
-                    "reason": reason,
-                })
             return result
 
     @staticmethod

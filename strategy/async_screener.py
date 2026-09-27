@@ -96,6 +96,17 @@ class AsyncStockScreener:
         return pd.concat([cls._completed_bars(ohlcv, today), pd.DataFrame([row])], ignore_index=True)
 
     @staticmethod
+    def at_upper_limit(price_data: Dict[str, Any]) -> bool:
+        """현재가가 상한가인지.
+
+        상한가에서는 시장가 매수가 거부된다 (실거래에서 접수 후 거부 5건). 체결되더라도
+        상한가가 풀리면 위로는 막혀 있고 아래로만 열려 있어, 매수 3분 만에 -4% 손절된
+        사례가 있다.
+        """
+        limit = price_data.get("upper_limit") or 0
+        return limit > 0 and price_data.get("price", 0) >= limit
+
+    @staticmethod
     def _session_elapsed_fraction(now: Optional[datetime] = None) -> float:
         """정규장(09:00~15:30) 중 경과 비율. 장 시작 전 0, 마감 후 1."""
         now = now or datetime.now()
@@ -650,6 +661,9 @@ class AsyncStockScreener:
                 price_data = await self.api_client.get_current_price(ticker)
                 if not price_data or not price_data.get("price"):
                     logger.info(f"[{ticker}] 실시간 시세 조회 실패 - 건너뜀")
+                    return {}
+                if self.at_upper_limit(price_data):
+                    logger.info(f"[{ticker}] 상한가 — 시장가 매수가 거부되므로 제외")
                     return {}
                 current_price = price_data["price"]
                 ohlcv_data = self._with_today_bar(ohlcv_data, price_data)

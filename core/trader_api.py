@@ -562,6 +562,7 @@ class AsyncKisAPI:
                 "volume":      int(out["acml_vol"]),
                 "amount":      int(out["acml_tr_pbmn"]),
                 "change_rate": float(out.get("prdy_ctrt", 0)),  # 전일대비율(%)
+                "upper_limit": self._to_int(out.get("stck_mxpr")),  # 상한가 (0이면 알 수 없음)
             }
         return None
         
