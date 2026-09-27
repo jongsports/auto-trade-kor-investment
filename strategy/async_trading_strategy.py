@@ -1,34 +1,95 @@
 import logging
 from datetime import datetime
+from typing import Awaitable, Callable, Dict, List, Optional
+
 import pandas as pd
 import asyncio
 
 import config
 from core.trader_api import AsyncKisAPI
 from risk.async_risk_manager import AsyncRiskManager
+from utils import market_calendar
+from utils.costs import net_pnl
+from utils.state_store import load_state, save_state
 from utils.utils import get_trading_time_status
 
 logger = logging.getLogger("auto_trade.trading_strategy")
+
+# 주문 접수 후 잔고에 반영되기까지 기다리는 시간
+ENTRY_FILL_GRACE_SECONDS = 60
+PENDING_SELL_GRACE_SECONDS = 30
+REBUY_COOLDOWN_SECONDS = 1800
+
+# 재시작 후에도 유지해야 하는 포지션 필드
+_PERSISTED_FIELDS = (
+    "ticker", "name", "quantity", "buy_price", "high_price", "entry_time",
+    "reason", "stop_price", "buy_trade_id", "pending_sell", "origin",
+)
+
+PositionRecoverer = Callable[[str], Awaitable[Optional[dict]]]
+
+
+def rejection(reason: str) -> dict:
+    """내부 사유로 주문을 내지 않았음을 나타내는 결과. API 실패와 구분된다."""
+    return {"rt_cd": "-1", "msg_cd": "REJECTED", "msg1": reason, "_rejected": True}
+
 
 class AsyncTradingStrategy:
     def __init__(self, api_client: AsyncKisAPI, risk_manager: AsyncRiskManager, candidate_stocks=None):
         self.api_client = api_client
         self.risk_manager = risk_manager
         self.candidate_stocks = candidate_stocks or []
-        
-        self.holdings = {}
+
+        self.holdings: Dict[str, dict] = self._load_positions()
         self.order_history = []
-        self.pending_orders = {}
-        self._selling_tickers: set = set()   # Issue #20: 매도 진행 중 종목 (중복 주문 방지)
         self._recently_sold: dict = {}        # Issue #21: 최근 매도 {ticker: unix_ts} (30분 쿨다운)
-        self._unsellable_tickers: set = set() # 거래정지/매매불가 종목 (세션 내 재시도 차단)
-        self._holdings_lock = asyncio.Lock()  # Holdings 동시 접근 방지
+        self._unsellable_tickers: set = set() # 거래정지/매매불가 종목 (당일 재시도 차단)
+        # 주문과 잔고 동기화를 직렬화한다. 스케줄러와 모니터 루프가 같은 분에 돌면서
+        # 같은 종목을 이중 매수하거나, 동기화가 방금 넣은 포지션을 지우는 것을 막는다.
+        self._order_lock = asyncio.Lock()
+
+        # 잔고에는 있는데 메타데이터가 없는 포지션을 복원하는 훅 (DB 조회). trader 가 주입.
+        self.position_recoverer: Optional[PositionRecoverer] = None
+        # 출처를 알 수 없어 Standard 규칙으로 편입한 종목 — trader 가 알림 후 비운다.
+        self.adopted_unknown: List[str] = []
 
         self.take_profit_ratio = config.TAKE_PROFIT_RATIO
         self.stop_loss_ratio = config.STOP_LOSS_RATIO
         self.trailing_stop = config.TRAILING_STOP
         self.max_stocks = config.MAX_STOCKS
-        
+
+    # ------------------------------------------------------------------ #
+    # 포지션 영속화
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _load_positions() -> Dict[str, dict]:
+        """저장된 포지션 메타데이터 복원.
+
+        메모리에만 두면 재시작·재배포 때 reason/entry_time 이 사라져 Overnight 로 산
+        종목이 다른 청산 규칙을 타고 보유일 시계도 0으로 돌아간다.
+        """
+        restored: Dict[str, dict] = {}
+        for ticker, info in (load_state("positions", {}) or {}).items():
+            try:
+                info = dict(info)
+                info["entry_time"] = datetime.fromisoformat(info["entry_time"])
+                restored[ticker] = info
+            except (KeyError, TypeError, ValueError) as e:
+                logger.error(f"[포지션복원] {ticker} 메타데이터 손상 — 건너뜀: {e}")
+        if restored:
+            logger.info(f"[포지션복원] {len(restored)}종목: "
+                        f"{[(t, i.get('reason')) for t, i in restored.items()]}")
+        return restored
+
+    def _persist(self) -> None:
+        data = {}
+        for ticker, info in self.holdings.items():
+            row = {k: info.get(k) for k in _PERSISTED_FIELDS if k in info}
+            row["entry_time"] = info["entry_time"].isoformat()
+            data[ticker] = row
+        save_state("positions", data)
+
     def set_candidate_stocks(self, candidate_stocks):
          self.candidate_stocks = candidate_stocks
 
@@ -42,41 +103,93 @@ class AsyncTradingStrategy:
          if self._unsellable_tickers:
               logger.info(f"[일별초기화] 매도 차단 해제: {sorted(self._unsellable_tickers)}")
               self._unsellable_tickers.clear()
+         cutoff = datetime.now().timestamp() - REBUY_COOLDOWN_SECONDS
+         self._recently_sold = {t: ts for t, ts in self._recently_sold.items() if ts > cutoff}
 
-    async def update_holdings(self):
-         async with self._holdings_lock:
-             await self._update_holdings_inner()
+    def open_tickers(self) -> List[str]:
+         """청산 판단 대상 — 매도 주문이 걸려 있거나 매도 차단된 종목은 제외."""
+         return [t for t, i in self.holdings.items()
+                 if not i.get("pending_sell") and t not in self._unsellable_tickers]
 
-    async def _update_holdings_inner(self):
+    # ------------------------------------------------------------------ #
+    # 잔고 동기화
+    # ------------------------------------------------------------------ #
+
+    async def update_holdings(self) -> bool:
+         """증권사 잔고와 대사한다. 조회 실패 시 False (로컬 상태 유지)."""
+         async with self._order_lock:
+             return await self._update_holdings_inner()
+
+    async def _update_holdings_inner(self) -> bool:
          account_info = await self.api_client.get_account_summary()
          if not account_info:
-              return
-              
-         positions = account_info.get("positions", [])
-         holdings_backup = self.holdings.copy()
-         self.holdings = {}
-         
-         for position in positions:
-              ticker = position.get("ticker", "")
-              if not ticker: continue
-              
-              current_info = holdings_backup.get(ticker, {}).copy()
-              current_info["ticker"] = ticker
-              current_info["name"] = position.get("name", "")
-              current_info["quantity"] = position.get("quantity", 0)
-              current_info["buy_price"] = position.get("buy_price", 0)
-              current_info["current_price"] = position.get("current_price", 0)
-              current_info["profit_loss"] = position.get("eval_profit_loss", 0)
-              
-              if "entry_time" not in current_info:
-                   current_info["entry_time"] = datetime.now()
-              if "high_price" not in current_info:
-                   current_info["high_price"] = position.get("current_price", 0)
-              elif position.get("current_price", 0) > current_info["high_price"]:
-                   current_info["high_price"] = position.get("current_price", 0)
-                   
-              self.holdings[ticker] = current_info
-              
+              return False
+
+         now = datetime.now()
+         broker = {p["ticker"]: p for p in account_info.get("positions", []) if p.get("ticker")}
+         reconciled: Dict[str, dict] = {}
+
+         for ticker, pos in broker.items():
+              info = self.holdings.get(ticker)
+              info = dict(info) if info else await self._adopt_position(ticker, now)
+
+              info["ticker"] = ticker
+              info["name"] = pos.get("name") or info.get("name") or ticker
+              info["quantity"] = pos.get("quantity", 0)
+              info["sellable_quantity"] = pos.get("sellable_quantity", info["quantity"])
+              if pos.get("buy_price", 0) > 0:
+                   info["buy_price"] = pos["buy_price"]   # 실제 매입 평단으로 교정
+              info["current_price"] = pos.get("current_price", 0)
+              info["profit_loss"] = pos.get("eval_profit_loss", 0)
+              info["high_price"] = max(info.get("high_price") or 0, info["current_price"])
+              info.pop("unconfirmed", None)
+
+              pending = info.get("pending_sell")
+              if pending and info["sellable_quantity"] > 0:
+                   age = (now - datetime.fromisoformat(pending["at"])).total_seconds()
+                   if age > PENDING_SELL_GRACE_SECONDS:
+                        logger.warning(
+                             f"[매도미체결] {ticker}: 접수 {age:.0f}초 후에도 매도가능수량 "
+                             f"{info['sellable_quantity']}주 — 주문이 풀린 것으로 보고 재시도 허용"
+                        )
+                        info["pending_sell"] = None
+              reconciled[ticker] = info
+
+         for ticker, info in self.holdings.items():
+              if ticker in broker:
+                   continue
+              if info.get("pending_sell"):
+                   logger.info(f"[청산확정] {ticker}: 잔고에서 제거됨")
+                   continue
+              age = (now - info["entry_time"]).total_seconds()
+              if age < ENTRY_FILL_GRACE_SECONDS:
+                   reconciled[ticker] = info   # 매수 체결이 아직 잔고에 안 잡힘
+                   continue
+              logger.warning(f"[포지션소실] {ticker}: 잔고에 없음 — 미체결 또는 외부 매도로 보고 제거")
+
+         self.holdings = reconciled
+         self._persist()
+         return True
+
+    async def _adopt_position(self, ticker: str, now: datetime) -> dict:
+         """잔고에는 있는데 로컬 메타데이터가 없는 포지션."""
+         if self.position_recoverer is not None:
+              try:
+                   recovered = await self.position_recoverer(ticker)
+              except Exception as e:
+                   logger.error(f"[포지션복원] {ticker} DB 조회 실패: {e}")
+                   recovered = None
+              if recovered:
+                   logger.warning(
+                        f"[포지션복원] {ticker}: DB 매수 기록에서 복원 "
+                        f"(reason={recovered.get('reason')} entry={recovered.get('entry_time')})"
+                   )
+                   return {**recovered, "origin": "db"}
+
+         logger.warning(f"[포지션편입] {ticker}: 출처 불명 — Standard 청산 규칙 적용")
+         self.adopted_unknown.append(ticker)
+         return {"entry_time": now, "reason": "Standard", "origin": "unknown"}
+
     async def check_entry_condition(self, ticker: str, ohlcv_data: pd.DataFrame,
                                     market_regime: str = "NORMAL") -> bool:
          status = get_trading_time_status()
@@ -167,53 +280,57 @@ class AsyncTradingStrategy:
             return False, f"Hold D+{days_held}"
         return False, "Hold"
 
-    async def check_exit_condition(self, ticker: str, market_regime: str = "NORMAL") -> tuple[bool, str]:
-         if ticker not in self.holdings:
-              return False, "Not held"
-              
-         holding_info = self.holdings[ticker]
+    async def _current_price(self, ticker: str, holding_info: dict) -> int:
+         """현재가. 시세 조회가 실패하면 마지막 잔고 동기화 값을 쓴다.
+
+         조회 실패를 이유로 청산 판단을 건너뛰면 급락 중 API 가 흔들릴 때 손절이 멈춘다.
+         """
          price_data = await self.api_client.get_current_price(ticker)
-         current_price = price_data["price"] if price_data else 0
+         if price_data and price_data.get("price"):
+              return price_data["price"]
+         fallback = holding_info.get("current_price", 0)
+         if fallback:
+              logger.warning(f"[시세조회실패] {ticker}: 잔고 기준가 {fallback:,}원으로 청산 판단")
+         return fallback
+
+    async def check_exit_condition(self, ticker: str, market_regime: str = "NORMAL") -> tuple[bool, str]:
+         holding_info = self.holdings.get(ticker)
+         if holding_info is None:
+              return False, "Not held"
+         if holding_info.get("pending_sell"):
+              return False, "Sell order pending"
+
+         current_price = await self._current_price(ticker, holding_info)
          status = get_trading_time_status()
-         
-         if not current_price: 
+
+         if not current_price:
               return False, "Invalid current price"
-         
+
          holding_info["current_price"] = current_price
          buy_price = holding_info.get("buy_price", 0)
          if buy_price <= 0:
               return False, "Invalid buy price"
          profit_ratio = current_price / buy_price - 1
-         holding_info["high_price"] = max(holding_info.get("high_price", current_price), current_price)
-         
-         # Identify Strategy Type (assume 'reason' was stored during entry)
-         # For backward compatibility, if 'reason' doesn't exist, we treat it as standard
+         holding_info["high_price"] = max(holding_info.get("high_price") or current_price, current_price)
+
          strategy_type = holding_info.get("reason", "Standard")
-         
+         now = datetime.now()
+         # 보유일은 거래일 기준. 달력일로 세면 금요일 매수분이 월요일에 D+3 이 되어
+         # D+1 익절 구간 없이 바로 강제 청산된다.
+         days_held = market_calendar.trading_days_between(holding_info["entry_time"], now)
+
          # --- 1. OVERNIGHT EXIT LOGIC (v2: 2026-04-24) ---
-         # Bug history: 이전 로직은 "now_str >= '09:05'" 문자열 사전식 비교 때문에
-         # 15:10 매수 직후 exit 체크에서 '15:10' >= '09:05' 참 → 즉시 청산되어
-         # 26건 연속 슬리피지 손실 누적.
-         # Fix: today > entry_date 가드 + D+2 오전 강제 청산 + D+1 조기 TP.
-         # Shadow C (2026-04-24): 트레일링 스탑 로직을 로그로 병행 기록. 실제 매매 영향 없음.
+         # Shadow C: 트레일링 스탑 로직을 로그로 병행 기록. 실제 매매 영향 없음.
          if strategy_type == "Overnight":
-              now_str = datetime.now().strftime("%H:%M")
-              entry_date = holding_info["entry_time"].date()
-              today = datetime.now().date()
-              days_held = (today - entry_date).days
+              now_str = now.strftime("%H:%M")
 
-              # B 결정 계산 (실제 매매)
-              b_exit, b_reason = self._b_overnight_decision(
-                   profit_ratio, days_held, now_str
-              )
+              b_exit, b_reason = self._b_overnight_decision(profit_ratio, days_held, now_str)
 
-              # C 결정 계산 (Shadow 로깅만)
               if getattr(config, "OVERNIGHT_SHADOW_C_ENABLED", False):
                    c_exit, c_reason = self._shadow_c_overnight_decision(
                         holding_info, profit_ratio, days_held, now_str
                    )
-                   high = holding_info.get("high_price", current_price)
-                   high_gain = (high / holding_info["buy_price"] - 1) if holding_info["buy_price"] else 0
+                   high_gain = holding_info["high_price"] / buy_price - 1
                    logger.info(
                         f"[SHADOW_C] {ticker} D+{days_held} pnl={profit_ratio:+.2%} "
                         f"peak={high_gain:+.2%} "
@@ -222,156 +339,178 @@ class AsyncTradingStrategy:
                    )
 
               return b_exit, b_reason
-              
-         # --- 2. MOMENTUM / INTRADAY / DAY TRADE LOGIC ---
-         # 스크리너는 "Overnight" / "Intraday" / "Momentum" 태그 반환 (Issue #9-D)
-         # "Momentum"/"Intraday": 짧은 trailing stop, 당일 청산
+
+         # --- 2. MOMENTUM / INTRADAY / STANDARD LOGIC ---
          is_short_term = strategy_type in ("Momentum", "Intraday")
          trailing_threshold = 0.02 if is_short_term else self.trailing_stop
          take_profit_threshold = 0.03 if is_short_term else self.take_profit_ratio
          max_holding_days = 1 if is_short_term else 5
 
-         # Take Profit
          if profit_ratio >= take_profit_threshold:
               return True, f"목표 수익권 도달 ({profit_ratio:.2%})"
-              
-         # Dynamic Stop Loss from Risk Manager
-         dynamic_sl = await self.risk_manager.calculate_dynamic_stoploss(ticker, holding_info["buy_price"])
-         if current_price <= dynamic_sl:
-              return True, f"리스크 관리 손절 (하단 지지선 {dynamic_sl:.0f} 돌파)"
-              
-         # Fallback static stop loss
+
+         # 손절가는 진입 시점에 정해 고정한다. 매 틱 재계산하면 장중 리스크 상태가
+         # 바뀌는 순간 손절선이 뛰어 멀쩡한 포지션이 즉시 청산된다.
+         stop_price = holding_info.get("stop_price")
+         if not stop_price:
+              stop_price = await self.risk_manager.calculate_dynamic_stoploss(ticker, buy_price)
+              holding_info["stop_price"] = stop_price
+              self._persist()
+         if current_price <= stop_price:
+              return True, f"리스크 관리 손절 (하단 지지선 {stop_price:.0f} 돌파)"
+
          if profit_ratio <= -self.stop_loss_ratio:
               return True, f"최대 허용 손실 초과 ({profit_ratio:.2%})"
-              
-         # Trailing Stop
+
          trailing = 1 - (current_price / holding_info["high_price"])
-         if trailing >= trailing_threshold and holding_info["high_price"] > holding_info["buy_price"] * 1.015:
+         if trailing >= trailing_threshold and holding_info["high_price"] > buy_price * 1.015:
               return True, f"고점 대비 하락 (트레일링 스탑 {trailing:.2%})"
-              
-         # Market conditions
+
          if status == "CLOSING_AUCTION":
               return True, "장 마감 전 동시호가 청산"
-              
-         holding_days = (datetime.now() - holding_info["entry_time"]).days
-         if holding_days >= max_holding_days:
-              return True, f"최대 보유 기간 경과 ({holding_days}일)"
-              
+
+         if days_held >= max_holding_days:
+              return True, f"최대 보유 기간 경과 ({days_held}거래일)"
+
          return False, "Hold"
 
+    def in_rebuy_cooldown(self, ticker: str) -> Optional[int]:
+        """매도 후 재매수 쿨다운 중이면 경과 분, 아니면 None."""
+        sold_at = self._recently_sold.get(ticker)
+        if sold_at is None:
+            return None
+        elapsed = datetime.now().timestamp() - sold_at
+        return int(elapsed / 60) if elapsed < REBUY_COOLDOWN_SECONDS else None
+
     async def entry(self, ticker: str, quantity: int = 0, price: int = 0,
-                    reason: str = "Momentum"):
-        """시장가 매수 주문 실행.
+                    reason: str = "Momentum", name: str = ""):
+        """시장가 매수. 수량은 리스크 한도 안에서 정하며 quantity 는 상한으로만 쓴다.
 
-        quantity가 0이면 리스크 매니저로 수량 자동 계산.
+        주문을 내지 않은 경우 `_rejected` 결과를 반환한다 (API 실패와 구분).
         """
-        can, msg = await self.risk_manager.can_trade(ticker, "buy", quantity, price)
-        if not can:
-            logger.warning(f"[매수거부] {ticker}: {msg}")
-            return None
+        async with self._order_lock:
+            if ticker in self.holdings:
+                return self._reject(ticker, "이미 보유 중")
 
-        if ticker in self.holdings:
-            logger.warning(f"[매수거부] {ticker}: 이미 보유 중")
-            return None
+            can, msg = await self.risk_manager.can_trade(ticker, "buy")
+            if not can:
+                return self._reject(ticker, msg)
 
-        # 수량이 지정되지 않은 경우 리스크 기반 자동 산정
-        if quantity <= 0:
-            account = await self.api_client.get_account_summary()
-            available = account.get("available_amount", 0)
-            if available <= 0:
-                logger.warning(f"[매수거부] {ticker}: 가용 잔고 없음")
-                return None
-            position_amount = await self.risk_manager.calculate_position_size(ticker, available)
             price_data = await self.api_client.get_current_price(ticker)
             current_price = price_data["price"] if price_data else 0
             if not current_price:
-                logger.warning(f"[매수거부] {ticker}: 현재가 조회 실패")
-                return None
-            quantity = max(1, int(position_amount // current_price))
+                return self._reject(ticker, "현재가 조회 실패")
 
-        if quantity <= 0:
-            logger.warning(f"[매수거부] {ticker}: 수량 0")
-            return None
+            plan = await self.risk_manager.plan_buy(ticker, current_price)
+            if not plan.ok:
+                return self._reject(ticker, plan.reason)
+            buy_qty = min(quantity, plan.quantity) if quantity > 0 else plan.quantity
 
-        logger.info(f"[매수시도] {ticker} {quantity}주 (reason={reason})")
-        result = await self.api_client.market_buy(ticker, quantity)
+            logger.info(f"[매수시도] {ticker} {buy_qty}주 (reason={reason})")
+            result = await self.api_client.market_buy(ticker, buy_qty)
 
-        if result.get("rt_cd") == "0":
-            price_data = await self.api_client.get_current_price(ticker)
-            current_price = price_data["price"] if price_data else price
-            # Find stock name from candidates if available
-            stock_name = next((c["name"] for c in self.candidate_stocks if c["ticker"] == ticker), ticker)
-            
-            self.holdings[ticker] = {
-                "ticker": ticker,
-                "name": stock_name,
-                "quantity": quantity,
-                "buy_price": current_price or price,
-                "current_price": current_price or price,
-                "high_price": current_price or price,
-                "entry_time": datetime.now(),
-                "reason": reason,
-            }
-            self.order_history.append({
-                "action": "BUY",
-                "ticker": ticker,
-                "quantity": quantity,
-                "price": current_price or price,
-                "time": datetime.now().isoformat(),
-                "reason": reason,
-            })
-        return result
+            accepted = result.get("rt_cd") == "0"
+            if accepted or result.get("_unconfirmed"):
+                stock_name = name or next(
+                    (c.get("name") for c in self.candidate_stocks if c.get("ticker") == ticker), ticker)
+                stop_price = None
+                if reason != "Overnight":
+                    stop_price = await self.risk_manager.calculate_dynamic_stoploss(ticker, current_price)
+                # 접수 여부를 모르는 주문도 임시로 올려 둔다. 체결됐다면 메타데이터가
+                # 보존되고, 아니면 동기화가 유예 시간 뒤에 제거한다.
+                self.holdings[ticker] = {
+                    "ticker": ticker,
+                    "name": stock_name,
+                    "quantity": buy_qty,
+                    "sellable_quantity": buy_qty,
+                    "buy_price": current_price,
+                    "current_price": current_price,
+                    "high_price": current_price,
+                    "entry_time": datetime.now(),
+                    "reason": reason,
+                    "stop_price": stop_price,
+                    "pending_sell": None,
+                    "origin": "bot",
+                    "unconfirmed": not accepted,
+                }
+                self._persist()
+            if accepted:
+                self.order_history.append({
+                    "action": "BUY",
+                    "ticker": ticker,
+                    "quantity": buy_qty,
+                    "price": current_price,
+                    "time": datetime.now().isoformat(),
+                    "reason": reason,
+                })
+            return result
+
+    @staticmethod
+    def _reject(ticker: str, reason: str) -> dict:
+        logger.info(f"[매수거부] {ticker}: {reason}")
+        return rejection(reason)
+
+    def set_buy_trade_id(self, ticker: str, trade_id: Optional[int]) -> None:
+        if ticker in self.holdings:
+            self.holdings[ticker]["buy_trade_id"] = trade_id
+            self._persist()
 
     async def exit(self, ticker: str, quantity: int = 0, reason: str = ""):
-        """시장가 매도 주문 실행."""
-        if ticker not in self.holdings:
-            logger.warning(f"[매도거부] {ticker}: 미보유 종목")
-            return None
+        """시장가 매도.
 
-        # Issue #20: 매도 진행 중 중복 주문 방지
-        if ticker in self._selling_tickers:
-            return None
+        접수(rt_cd=0)는 체결이 아니다. 접수 후에는 포지션을 지우지 않고 pending_sell 로
+        표시해 두고, 잔고에서 사라진 것을 동기화가 확인했을 때 제거한다. 15:20 동시호가
+        매도를 접수 즉시 지우면 15:30 체결 전까지 잔고 동기화가 다시 넣어 재매도한다.
+        """
+        async with self._order_lock:
+            info = self.holdings.get(ticker)
+            if info is None:
+                logger.warning(f"[매도거부] {ticker}: 미보유 종목")
+                return None
+            if info.get("pending_sell") or ticker in self._unsellable_tickers:
+                return None
 
-        # 거래정지/매매불가 종목 재시도 차단
-        if ticker in self._unsellable_tickers:
-            return None
+            sellable = info.get("sellable_quantity", info.get("quantity", 0))
+            if sellable <= 0:
+                logger.info(f"[매도보류] {ticker}: 매도가능수량 0 — 미체결 주문 대기")
+                return None
+            sell_qty = min(quantity, sellable) if quantity > 0 else sellable
 
-        held_qty = self.holdings[ticker].get("quantity", 0)
-        if held_qty <= 0:
-            logger.warning(f"[매도거부] {ticker}: 보유수량 0")
-            return None
+            can, msg = await self.risk_manager.can_trade(ticker, "sell")
+            if not can:
+                logger.warning(f"[매도거부] {ticker}: {msg}")
+                return None
 
-        sell_qty = quantity if quantity > 0 else held_qty
-
-        can, msg = await self.risk_manager.can_trade(ticker, "sell", sell_qty, 0)
-        if not can:
-            logger.warning(f"[매도거부] {ticker}: {msg}")
-            return None
-
-        self._selling_tickers.add(ticker)
-        try:
             logger.info(f"[매도시도] {ticker} {sell_qty}주 (reason={reason})")
             result = await self.api_client.market_sell(ticker, sell_qty)
 
-            if result.get("rt_cd") == "0":
-                price_data = await self.api_client.get_current_price(ticker)
-                current_price = price_data["price"] if price_data else 0
-                buy_price = self.holdings[ticker].get("buy_price", 0)
-                profit_ratio = (current_price / buy_price - 1) if buy_price > 0 and current_price else 0
+            accepted = result.get("rt_cd") == "0"
+            if accepted or result.get("_unconfirmed"):
+                info["pending_sell"] = {
+                    "at": datetime.now().isoformat(),
+                    "reason": reason,
+                    "quantity": sell_qty,
+                }
+                info["sellable_quantity"] = sellable - sell_qty
+                self._persist()
+            if accepted:
+                current_price = await self._current_price(ticker, info)
+                buy_price = info.get("buy_price", 0)
+                pnl_amount, profit_ratio = net_pnl(buy_price, current_price, sell_qty)
                 self.order_history.append({
                     "action": "SELL",
                     "ticker": ticker,
+                    "name": info.get("name", ticker),
                     "quantity": sell_qty,
                     "price": current_price or 0,
                     "time": datetime.now().isoformat(),
                     "reason": reason,
-                    "profit_ratio": profit_ratio,
+                    "strategy": info.get("reason", "Standard"),
+                    "profit_ratio": profit_ratio,   # 수수료·거래세 차감 후
+                    "pnl_amount": pnl_amount,
                 })
-                del self.holdings[ticker]
                 self._recently_sold[ticker] = datetime.now().timestamp()
             elif result.get("_unsellable"):
                 self._unsellable_tickers.add(ticker)
-                logger.warning(f"[매도차단] {ticker}: 거래정지/매매불가 — 더 이상 재시도하지 않음")
-        finally:
-            self._selling_tickers.discard(ticker)
-        return result
+                logger.warning(f"[매도차단] {ticker}: 거래정지/매매불가 — 당일 재시도하지 않음")
+            return result

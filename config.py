@@ -105,6 +105,10 @@ BACKTEST_INITIAL_CAPITAL = int(bt_config.get("initial_capital", 100000000))
 BACKTEST_COMMISSION = float(bt_config.get("commission", 0.00015))
 BACKTEST_SLIPPAGE = float(bt_config.get("slippage", 0.0001))
 
+# 거래 비용 (라이브 손익 추정과 백테스트가 같은 값을 쓴다)
+COMMISSION_RATE = float(trading_config.get("commission", BACKTEST_COMMISSION))  # 편도 수수료
+SELL_TAX_RATE = float(trading_config.get("sell_tax", 0.0020))                   # 매도 시 거래세+농특세
+
 # 로깅 설정
 log_config = config.get("logging", {})
 LOG_LEVEL = log_config.get("level", "INFO")
@@ -146,6 +150,15 @@ OVERNIGHT_SHADOW_C_ENABLED = True
 OVERNIGHT_TRAILING_STOP = 0.03          # D+1 고점 대비 3% 하락 시 가상 청산
 OVERNIGHT_TRAILING_ACTIVATION = 0.015   # 트레일링 활성화 기준 (+1.5%)
 OVERNIGHT_RUNNER_TP = 0.10              # 극단 이익(+10%) 확정 (스파이크 대응)
+
+# 멀티에이전트 레이어 (agents/). 감사(2026-09-27) 결과 매수 거부권은 한 번도 작동한
+# 적이 없고(크래시 → 전원 통과), 시장 체제를 항상 NORMAL 로 고정했으며, 전략이 보유로
+# 판단한 포지션을 매도했고, 휴장일에도 API 를 폴링해 공유 서킷브레이커를 열었다.
+# 백테스트로 검증되지 않은 상태이므로 기본은 끈다.
+AGENTS_ENABLED = bool(config.get("agents", {}).get("enabled", False))
+
+# Overnight 외(Intraday/Momentum/시초가) 진입 허용 여부.
+INTRADAY_ENTRY_ENABLED = bool(trading_config.get("intraday_entry_enabled", True))
 
 MORNING_ENTRY_START = "09:00"
 MORNING_ENTRY_END = "09:05"
@@ -191,7 +204,12 @@ LOG_DIR = Path("logs")
 BACKTEST_DIR = Path("backtest_results")
 SCREENING_RESULTS_FILE = DATA_DIR / "screening_results.json"
 
+# 재시작을 넘겨 유지할 상태 (포지션 메타데이터, 확인된 개장일, 일일 손익).
+# 서버에서는 디렉터리째 볼륨 마운트된다.
+STATE_DIR = DATA_DIR / "state"
+
 DATA_DIR.mkdir(exist_ok=True)
+STATE_DIR.mkdir(exist_ok=True)
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True) if os.path.dirname(LOG_FILE) else LOG_DIR.mkdir(exist_ok=True)
 BACKTEST_DIR.mkdir(exist_ok=True)
 
@@ -204,7 +222,10 @@ def setup_logging():
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
         
-    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    # 크기 기준 로테이션. 로테이션 없이 쓰면 서버 로그가 단일 파일로 계속 커진다.
+    from logging.handlers import RotatingFileHandler
+    file_handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=LOG_MAX_SIZE, backupCount=LOG_BACKUP_COUNT, encoding="utf-8")
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
     root_logger.addHandler(file_handler)
     

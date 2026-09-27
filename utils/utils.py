@@ -273,10 +273,8 @@ def is_trading_day(date=None):
     Returns:
         bool: 평일이고 공휴일이 아니면 True
     """
-    d = date or datetime.now()
-    if d.weekday() >= 5:
-        return False
-    return d.strftime("%Y%m%d") not in load_holidays()
+    from utils import market_calendar
+    return market_calendar.is_trading_day(date)
 
 
 def is_market_open():
@@ -285,15 +283,8 @@ def is_market_open():
     Returns:
         bool: 시장 개장 여부
     """
-    # 주말 체크
     now = datetime.now()
-    if now.weekday() >= 5:  # 5: 토요일, 6: 일요일
-        return False
-
-    # 공휴일 체크
-    today_str = now.strftime("%Y%m%d")
-    holidays = load_holidays()
-    if today_str in holidays:
+    if not is_trading_day(now):
         return False
 
     # 시간 체크
@@ -366,44 +357,9 @@ def load_holidays():
         f"{current_year}1225",  # 크리스마스
     ]
 
-    # TODO: 설날, 추석 등 음력 기반 공휴일은 별도 계산 필요
-
-    # 파일에 저장
-    save_to_json(default_holidays, holiday_file)
-
+    # 음력 공휴일·대체공휴일은 여기 없다. 이 목록은 KIS 휴장일조회가 닿지 않을 때의
+    # 최후 폴백이며 파일에 쓰지 않는다 (불완전한 목록이 실제 달력 행세를 하게 된다).
     return default_holidays
-
-
-def update_holidays_from_api(api_client):
-    """한국투자증권 API를 통해 휴장일 정보 업데이트
-
-    Args:
-        api_client (KisAPI): 한국투자증권 API 클라이언트
-
-    Returns:
-        bool: 업데이트 성공 여부
-    """
-    try:
-        # API로 휴장일 조회
-        holiday_data = api_client.get_holidays()
-
-        if not holiday_data:
-            logger.warning("휴장일 정보를 가져오는데 실패했습니다.")
-            return False
-
-        # 휴장일 목록 추출
-        holidays = [item["date"] for item in holiday_data]
-
-        # 파일에 저장
-        holiday_file = os.path.join(config.DATA_DIR, "holidays.json")
-        save_to_json(holidays, holiday_file)
-
-        logger.info(f"휴장일 정보 업데이트 완료: {len(holidays)}개")
-        return True
-
-    except Exception as e:
-        logger.error(f"휴장일 정보 업데이트 중 오류 발생: {str(e)}")
-        return False
 
 
 def get_trading_time_status():
@@ -420,14 +376,7 @@ def get_trading_time_status():
     """
     now = datetime.now()
 
-    # 주말 체크
-    if now.weekday() >= 5:  # 5: 토요일, 6: 일요일
-        return "CLOSED"
-
-    # 공휴일 체크
-    today_str = now.strftime("%Y%m%d")
-    holidays = load_holidays()
-    if today_str in holidays:
+    if not is_trading_day(now):
         return "CLOSED"
 
     # 시간 체크

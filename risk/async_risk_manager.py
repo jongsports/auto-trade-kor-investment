@@ -1,15 +1,60 @@
 import logging
-import asyncio
-import pandas as pd
-import numpy as np
+import math
+from dataclasses import dataclass
 from datetime import datetime
-import threading
+
+import numpy as np
+import pandas as pd
 
 import config
 from core.trader_api import AsyncKisAPI
+from utils.state_store import load_state, save_state
 from utils.utils import is_trading_time, get_trading_time_status
 
 logger = logging.getLogger("auto_trade.risk_manager")
+
+# 시장가 매수는 KIS 가 상한가(+30%) 기준으로 증거금을 잡는다.
+MARKET_ORDER_MARGIN = 1.30
+
+
+@dataclass(frozen=True)
+class BuyPlan:
+    quantity: int
+    reason: str = ""   # quantity == 0 일 때의 사유
+
+    @property
+    def ok(self) -> bool:
+        return self.quantity > 0
+
+
+def plan_buy_quantity(*, price: float, target_amount: float, equity: float, cash: float,
+                      invested: float, position_count: int,
+                      max_investment_ratio: float, max_stock_count: int) -> BuyPlan:
+    """매수 수량을 정한다. 한도를 지킬 수 없으면 0주(진입 포기)다.
+
+    수량 산정과 한도 검사가 한 곳에 있어야 "최소 1주는 산다" 같은 예외가 한도를
+    뚫지 못한다. 과거에는 max(1, ...) 때문에 계좌의 27%짜리 주문이 나갔다.
+    """
+    if price <= 0 or equity <= 0:
+        return BuyPlan(0, "가격 또는 총평가액을 알 수 없음")
+    if position_count >= max_stock_count:
+        return BuyPlan(0, f"최대 보유 종목 수 도달 ({position_count}/{max_stock_count})")
+
+    room = equity * max_investment_ratio - invested
+    if room <= 0:
+        return BuyPlan(0, f"투자 비율 한도 도달 ({invested / equity:.1%} 보유 / "
+                          f"한도 {max_investment_ratio:.1%})")
+
+    limits = {
+        f"종목당 예산 {target_amount:,.0f}원": target_amount,
+        f"투자 비율 한도까지 남은 {room:,.0f}원": room,
+        f"가용 현금 {cash:,.0f}원(시장가 증거금 {MARKET_ORDER_MARGIN:.0%} 기준)": cash / MARKET_ORDER_MARGIN,
+    }
+    binding = min(limits, key=limits.get)
+    quantity = math.floor(limits[binding] / price)
+    if quantity <= 0:
+        return BuyPlan(0, f"주가 {price:,.0f}원이 {binding} 초과")
+    return BuyPlan(quantity)
 
 class AsyncRiskManager:
     def __init__(self, api_client: AsyncKisAPI):
@@ -23,17 +68,22 @@ class AsyncRiskManager:
         self.max_total_position = config.MAX_INVESTMENT_RATIO
         self.position_size_multiplier = dict(config.RISK_POSITION_MULTIPLIER)
 
-        # 일일 손익 추적 (C3)
-        self._daily_realized_pnl: float = 0.0
-        self._daily_pnl_date: str = ""
+        # 일일 실현 손익 — 재시작해도 당일 손실 한도가 0으로 돌아가지 않도록 파일에 둔다.
+        saved = load_state("daily_pnl", {})
+        self._daily_pnl_date: str = str(saved.get("date", ""))
+        self._daily_realized_pnl: float = float(saved.get("realized_pnl", 0.0))
+
+    def daily_realized_pnl(self) -> float:
+        """오늘의 실현 손익. 날짜가 바뀌었으면 0."""
+        today = datetime.now().strftime("%Y%m%d")
+        return self._daily_realized_pnl if self._daily_pnl_date == today else 0.0
 
     def record_trade_pnl(self, pnl_amount: float):
-        """매도 체결 후 실현 손익 기록 (C3)."""
+        """매도 후 실현 손익 기록."""
         today = datetime.now().strftime("%Y%m%d")
-        if self._daily_pnl_date != today:
-            self._daily_realized_pnl = 0.0
-            self._daily_pnl_date = today
-        self._daily_realized_pnl += pnl_amount
+        self._daily_realized_pnl = self.daily_realized_pnl() + pnl_amount
+        self._daily_pnl_date = today
+        save_state("daily_pnl", {"date": today, "realized_pnl": self._daily_realized_pnl})
         logger.info(f"[일일 손익] 누적: {self._daily_realized_pnl:+,.0f}원")
 
     async def assess_market_risk(self):
@@ -86,17 +136,17 @@ class AsyncRiskManager:
             if self.market_condition in ("BULL",):
                 self.market_condition = "NORMAL"
 
-    async def calculate_position_size(self, ticker: str, account_balance: float) -> float:
-        """변동성 역비례 포지션 사이징 (R4).
+    async def position_size_ratio(self, ticker: str) -> float:
+        """총평가액 대비 종목당 목표 비중 — 변동성 역비례 (R4).
 
         기준 변동성 20%에서 max_position_size 배정.
-        저변동(10%) → 2배 확대, 고변동(40%) → 0.5배 축소.
-        리스크 상태별 배율 추가 적용.
+        저변동(10%) → 확대, 고변동(40%) → 축소. 체제·리스크 배율 추가 적용.
+        데이터를 못 받으면 0 (진입 포기).
         """
         try:
             price_data = await self.api_client.get_ohlcv(ticker, "D", 20)
             if price_data.empty:
-                return 0
+                return 0.0
             returns = price_data["close"].pct_change().dropna()
             volatility = returns.std() * np.sqrt(252)
             vol_factor = 0.2 / volatility if volatility > 0 else 1.0
@@ -115,10 +165,36 @@ class AsyncRiskManager:
                 f"[PosSizing-RM] {ticker}: vol={volatility:.2%} × regime={regime_mult:.2f} "
                 f"× risk={risk_mult:.2f} → {position_size:.2%}"
             )
-            return account_balance * position_size
+            return float(position_size)
         except Exception as e:
             logger.error(f"포지션 사이징 오류 {ticker}: {e}")
-            return 0
+            return 0.0
+
+    async def plan_buy(self, ticker: str, price: float) -> BuyPlan:
+        """현재 계좌 상태에서 이 종목을 몇 주 살 수 있는지 정한다."""
+        account = await self.api_client.get_account_summary()
+        if not account:
+            # 조회 실패는 "보유 없음"이 아니다. 한도를 확인할 수 없으면 사지 않는다.
+            return BuyPlan(0, "잔고 조회 실패 — 한도 확인 불가")
+
+        equity = float(account.get("total_evaluated_amount", 0))
+        positions = account.get("positions", [])
+        invested = float(sum(p.get("current_price", 0) * p.get("quantity", 0) for p in positions))
+
+        ratio = await self.position_size_ratio(ticker)
+        if ratio <= 0:
+            return BuyPlan(0, "변동성 데이터 없음 — 사이징 불가")
+
+        return plan_buy_quantity(
+            price=price,
+            target_amount=equity * ratio,
+            equity=equity,
+            cash=float(account.get("available_amount", 0)),
+            invested=invested,
+            position_count=len(positions),
+            max_investment_ratio=config.MAX_INVESTMENT_RATIO,
+            max_stock_count=config.MAX_STOCK_COUNT,
+        )
 
     async def calculate_dynamic_stoploss(self, ticker: str, entry_price: float) -> float:
         """ATR 기반 동적 손절가 계산."""
@@ -145,8 +221,10 @@ class AsyncRiskManager:
 
             dynamic_sl = entry_price - (atr * atr_factor)
 
-            # config LOSS_CUT_RATIO(2%)를 최대 손실 하한선으로 사용
+            # LOSS_CUT_RATIO 를 최대 손실 하한선으로 사용
             max_loss_price = entry_price * (1 - config.LOSS_CUT_RATIO)
+            if not np.isfinite(dynamic_sl):
+                return fallback
 
             return max(dynamic_sl, max_loss_price)
 
@@ -154,64 +232,41 @@ class AsyncRiskManager:
             logger.error(f"Error calculating dynamic stop loss for {ticker}: {e}")
             return fallback
 
-    async def can_trade(self, ticker: str, order_type: str, quantity: int, price: float) -> tuple[bool, str]:
+    async def can_trade(self, ticker: str, order_type: str) -> tuple[bool, str]:
+        """주문을 낼 수 있는 시점·상태인지 판단한다.
+
+        금액·종목 수 한도는 여기서 보지 않는다. 수량이 정해지기 전에는 검사할 수
+        없으므로 plan_buy 가 수량 산정과 함께 처리한다.
+        """
         # 매도는 동시호가(CLOSING_AUCTION, 15:20~15:30)도 허용
         if order_type == "sell":
             status = get_trading_time_status()
             if status not in ("REGULAR", "CLOSING_AUCTION", "OPENING_AUCTION"):
                 return False, f"매도 불가 시간 (status={status})"
-        else:
-            if not is_trading_time():
-                return False, "Not trading time."
-        if self.risk_status == "RISK" and order_type == "buy":
+            return True, "OK"
+
+        if not is_trading_time():
+            return False, "Not trading time."
+
+        if self.risk_status == "RISK":
             # Issue #23: BEAR에서만 완전 차단, 나머지 체제는 포지션 축소 후 허용
-            # 기존: BULL만 허용 → VOLATILE_DOWN에서 매수 전면 차단 (오작동)
             if self.market_condition == "BEAR":
                 return False, "Market is BEAR + RISK — 매수 차단."
-            logger.warning(f"[RISK+{self.market_condition}] 고변동성 — 포지션 사이징 RISK 배율({self.position_size_multiplier.get('RISK', 0.4)}) 적용 후 허용")
+            logger.warning(
+                f"[RISK+{self.market_condition}] 고변동성 — 포지션 사이징 RISK 배율"
+                f"({self.position_size_multiplier.get('RISK', 0.4)}) 적용 후 허용"
+            )
 
-        # 일일 최대 손실 한도 체크 (C3)
-        if order_type == "buy":
-            today = datetime.now().strftime("%Y%m%d")
-            if self._daily_pnl_date == today and self._daily_realized_pnl < 0:
-                try:
-                    account = await self.api_client.get_account_summary()
-                    total_eval = account.get("total_evaluated_amount", 0)
-                    if total_eval > 0:
-                        daily_loss_ratio = abs(self._daily_realized_pnl) / total_eval
-                        if daily_loss_ratio >= self.max_daily_loss:
-                            return False, f"일일 최대 손실 한도 도달 ({daily_loss_ratio:.2%} >= {self.max_daily_loss:.2%})"
-                except Exception as e:
-                    logger.warning(f"일일 손실 한도 체크 오류: {e}")
-
-        # 잔고 및 포지션 수 체크 (매수 시에만)
-        if order_type == "buy":
-            try:
-                account = await self.api_client.get_account_summary()
-                positions = account.get("positions", [])
-
-                # 최대 보유 종목 수 체크
-                if len(positions) >= config.MAX_STOCK_COUNT:
-                    return False, f"최대 보유 종목 수 초과 ({len(positions)}/{config.MAX_STOCK_COUNT})"
-
-                # 가용 잔고 체크
-                available = account.get("available_amount", 0)
-                order_amount = quantity * price if quantity > 0 and price > 0 else 0
-                if order_amount > 0 and available < order_amount:
-                    return False, f"가용 잔고 부족 (필요: {order_amount:,}원, 가용: {available:,}원)"
-
-                # 전체 투자 비율 체크 (매수 후 비율 기준)
-                total_eval = account.get("total_evaluated_amount", 0)
-                if total_eval > 0:
-                    invested = sum(
-                        int(p.get("current_price", 0)) * int(p.get("quantity", 0))
-                        for p in positions
-                    )
-                    post_trade_ratio = (invested + order_amount) / total_eval
-                    if post_trade_ratio >= config.MAX_INVESTMENT_RATIO:
-                        return False, f"최대 투자 비율 초과 ({post_trade_ratio:.1%}/{config.MAX_INVESTMENT_RATIO:.1%})"
-
-            except Exception as e:
-                logger.warning(f"can_trade 잔고 체크 오류: {e}")
+        # 일일 최대 손실 한도
+        realized = self.daily_realized_pnl()
+        if realized < 0:
+            account = await self.api_client.get_account_summary()
+            total_eval = account.get("total_evaluated_amount", 0) if account else 0
+            if total_eval <= 0:
+                return False, "잔고 조회 실패 — 일일 손실 한도 확인 불가"
+            daily_loss_ratio = abs(realized) / total_eval
+            if daily_loss_ratio >= self.max_daily_loss:
+                return False, (f"일일 최대 손실 한도 도달 "
+                               f"({daily_loss_ratio:.2%} >= {self.max_daily_loss:.2%})")
 
         return True, "OK"

@@ -11,10 +11,22 @@ trading:
   volatility_lookback: 20
   max_stock_ratio: 0.1
   max_investment_ratio: 0.2
-  loss_cut_ratio: 0.0466
-  profit_cut_ratio: 0.1436
+  # loss_cut_ratio / profit_cut_ratio 는 2026-05-17 에 0.0466 / 0.1436 으로 바뀌어 있었다.
+  # 최적화 결과가 아니라 optuna 첫 난수 샘플이었다 (목적함수가 항상 0 을 반환하는 버그).
+  # 그 전 값으로 되돌린다.
+  loss_cut_ratio: 0.02
+  profit_cut_ratio: 0.05
   max_stock_count: 3
-  max_hold_days: 2
+  max_hold_days: 3
+  # 거래 비용. sell_tax 는 매도 금액에 붙는 증권거래세+농특세다.
+  # 실제 체결내역의 제세금과 다르면 이 값을 고칠 것.
+  commission: 0.00015
+  sell_tax: 0.002
+  # Overnight 외(시초가·장중 모멘텀) 진입 허용 여부
+  intraday_entry_enabled: true
+agents:
+  # 멀티에이전트 레이어. 검증 전까지 끈다 (config.py 의 AGENTS_ENABLED 주석 참고).
+  enabled: false
 notifications:
   telegram:
     enabled: true

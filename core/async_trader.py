@@ -13,7 +13,8 @@ from data.trade_db import TradeDatabase
 from utils.notifier import AsyncTelegramNotifier
 from risk.async_risk_manager import AsyncRiskManager as RiskManager
 from strategy.async_trading_strategy import AsyncTradingStrategy as TradingStrategy
-from agents.coordinator import AgentCoordinator
+from utils import market_calendar
+from utils.costs import net_pnl
 
 logger = logging.getLogger("auto_trade.auto_trader")
 
@@ -35,15 +36,19 @@ class AsyncAutoTrader:
 
         self.risk_manager = RiskManager(self.api_client)
         self.strategy = TradingStrategy(self.api_client, self.risk_manager)
+        self.strategy.position_recoverer = self._recover_position_from_db
 
-        # ── 멀티에이전트 시스템 ──────────────────────────────────────────────
-        self.coordinator = AgentCoordinator(
-            api_client=self.api_client,
-            config=config,
-            risk_manager=self.risk_manager,
-            news_analyzer=self.news_analyzer,
-            strategy=self.strategy,  # Step 12: Holdings 단일 소스 참조
-        )
+        # ── 멀티에이전트 시스템 (config.AGENTS_ENABLED 일 때만 구성) ──────────
+        self.coordinator = None
+        if config.AGENTS_ENABLED:
+            from agents.coordinator import AgentCoordinator
+            self.coordinator = AgentCoordinator(
+                api_client=self.api_client,
+                config=config,
+                risk_manager=self.risk_manager,
+                news_analyzer=self.news_analyzer,
+                strategy=self.strategy,  # Step 12: Holdings 단일 소스 참조
+            )
 
         self.running = False
         self.candidate_stocks = []
@@ -51,12 +56,10 @@ class AsyncAutoTrader:
 
         # 청산 실패 연속 카운터 (ticker → 실패 횟수)
         self._exit_fail_counts: Dict[str, int] = {}
-        self._open_day_checked_for: Optional[str] = None  # KIS 개장일 조회 수행한 날짜
-        self._open_day_cache: Optional[bool] = None       # KIS 개장일 판정 결과
+        self._open_day_query_at: Optional[datetime] = None   # 마지막 KIS 개장일 조회 시각
+        self._trading_halted_on: str = ""                     # 당일 매매 중단 결정 날짜
 
-        # DB (ticker → buy_trade_id 매핑: 매수 저장 ID를 매도 시 연결)
         self.db = TradeDatabase()
-        self._buy_trade_ids: Dict[str, Optional[int]] = {}
 
         # 중복 트리거 방지 — 당일 실행 완료 이벤트 기록
         self._triggered: set = set()
@@ -65,32 +68,50 @@ class AsyncAutoTrader:
         # 체제 전환 알림용 — 마지막 보고한 체제 기억
         self._last_reported_regime: str = ""
 
-        # 자동 최적화 — 거래 누적 카운터 + 마지막 최적화 일자
-        self._trades_since_last_optimize: int = 0
-        self._last_optimize_date: str = ""
-        self._AUTO_OPTIMIZE_TRADE_THRESHOLD = 50  # 50거래마다 자동 최적화
-        self._AUTO_OPTIMIZE_DAY = 5               # 토요일(weekday=5)에 주간 자동 최적화
+        # 태스크 재시작 알림 중복 억제
+        self._restart_alerts: Dict[str, datetime] = {}
 
     # ------------------------------------------------------------------ #
     # 시장 체제 조회 헬퍼
     # ------------------------------------------------------------------ #
 
     def _get_current_market_regime(self) -> str:
-        """현재 시장 체제 문자열 반환.
+        """현재 시장 체제 — RiskManager 의 판정이 단일 출처다.
 
-        우선순위:
-          1. AgentCoordinator의 MarketIntel 컨텍스트 (가장 정확)
-          2. RiskManager의 market_condition (fallback)
+        과거에는 MarketIntel 에이전트의 컨텍스트를 우선했는데, 그쪽은 데이터 부족으로
+        한 번도 판정에 성공하지 못해 기본값 NORMAL 이 항상 반환됐다. 같은 기간
+        RiskManager 는 BULL/VOLATILE_* 를 판정하고 있었지만 쓰이지 않았다.
         """
+        return self.risk_manager.market_condition
+
+    async def _recover_position_from_db(self, ticker: str) -> Optional[dict]:
+        """잔고에 있는 종목의 매수 메타데이터를 DB 에서 복원."""
+        row = await self.db.get_open_buy(ticker)
+        if not row:
+            return None
+        return {
+            "entry_time": row["executed_at"].replace(tzinfo=None),
+            "reason": row.get("strategy") or "Standard",
+            "buy_trade_id": row["id"],
+            "name": row.get("name") or ticker,
+        }
+
+    async def _sync_holdings(self) -> bool:
+        """잔고 대사 후, 출처 불명으로 편입된 종목이 있으면 알린다."""
         try:
-            if hasattr(self, "coordinator") and self.coordinator:
-                ctx = self.coordinator.get_market_context()
-                if ctx and ctx.regime:
-                    regime = ctx.regime
-                    return regime.value if hasattr(regime, "value") else str(regime)
-        except Exception:
-            pass
-        return self.risk_manager.market_condition  # "BULL" / "BEAR" / "NORMAL"
+            ok = await self.strategy.update_holdings()
+        except Exception as e:
+            logger.error(f"잔고 동기화 오류: {e}")
+            return False
+        adopted, self.strategy.adopted_unknown = self.strategy.adopted_unknown, []
+        for ticker in adopted:
+            info = self.strategy.holdings.get(ticker, {})
+            await self.notifier.send_message(
+                f"⚠️ <b>출처 불명 포지션 편입</b> {info.get('name', ticker)} ({ticker})\n"
+                f"잔고에 있으나 봇의 매수 기록이 없습니다. Standard 청산 규칙을 적용합니다.\n"
+                f"직접 매수한 종목이라면 봇이 청산할 수 있으니 확인하세요."
+            )
+        return ok
 
     # ------------------------------------------------------------------ #
     # 라이프사이클
@@ -130,11 +151,19 @@ class AsyncAutoTrader:
         )
 
         # ── 에이전트 시스템 시작 ──────────────────────────────────────────────
-        try:
-            await self.coordinator.start()
-            logger.info("✅ 멀티에이전트 시스템 시작 완료")
-        except Exception as e:
-            logger.warning(f"에이전트 시스템 시작 실패 (기존 로직으로 계속): {e}")
+        if self.coordinator:
+            try:
+                await self.coordinator.start()
+                logger.info("✅ 멀티에이전트 시스템 시작 완료")
+            except Exception as e:
+                logger.warning(f"에이전트 시스템 시작 실패 (기존 로직으로 계속): {e}")
+        else:
+            logger.info("멀티에이전트 레이어 비활성 (config.AGENTS_ENABLED=False)")
+
+        # 0. 보유 포지션 대사 — 재시작 직후에도 손절 감시가 바로 돌도록 가장 먼저 한다.
+        if not await self._sync_holdings():
+            logger.error("기동 시 잔고 동기화 실패 — 모니터 루프에서 재시도")
+        logger.info(f"보유 포지션: {[(t, i.get('reason')) for t, i in self.strategy.holdings.items()]}")
 
         # 1. 초기 시장 리스크 평가 (issue #6-C: assess_market_risk 미호출 수정)
         await self.risk_manager.assess_market_risk()
@@ -151,7 +180,12 @@ class AsyncAutoTrader:
                     break
                 except Exception as e:
                     logger.error(f"[{name}] 예외 발생, 5초 후 재시작: {e}", exc_info=True)
-                    await self.notifier.send_message(f"⚠️ <b>[{name}] 태스크 재시작</b>\n오류: {e}")
+                    # 같은 예외가 반복되면 5초마다 알림이 나가므로 10분에 한 번만 보낸다.
+                    last = self._restart_alerts.get(name)
+                    if last is None or (datetime.now() - last).total_seconds() > 600:
+                        self._restart_alerts[name] = datetime.now()
+                        await self.notifier.send_message(
+                            f"⚠️ <b>[{name}] 태스크 재시작</b>\n오류: {e}")
                     await asyncio.sleep(5)
 
         self.tasks = [
@@ -162,13 +196,19 @@ class AsyncAutoTrader:
 
     async def stop(self):
         self.running = False
+        # 진행 중인 주문이 있으면 끝날 때까지 기다린다 (중간에 끊으면 접수 여부를 모른다).
+        try:
+            await asyncio.wait_for(self.strategy._order_lock.acquire(), timeout=20)
+            self.strategy._order_lock.release()
+        except asyncio.TimeoutError:
+            logger.error("종료 대기 중 주문이 20초 내에 끝나지 않음 — 강제 종료")
         for task in getattr(self, "tasks", []):
             task.cancel()
-        # 에이전트 종료
-        try:
-            await self.coordinator.stop()
-        except Exception as e:
-            logger.debug(f"에이전트 종료 오류: {e}")
+        if self.coordinator:
+            try:
+                await self.coordinator.stop()
+            except Exception as e:
+                logger.warning(f"에이전트 종료 오류: {e}")
         await self.api_client.close()
         await self.db.close()
         logger.info("엔진이 중지되었습니다.")
@@ -195,40 +235,45 @@ class AsyncAutoTrader:
     # 다단계 동적 스크리닝 스케줄러 (issue #8)
     # ------------------------------------------------------------------ #
 
-    async def _confirm_open_day(self, now: datetime, local_guess: bool) -> bool:
-        """로컬 달력의 개장일 판정을 KIS 조회로 검증 (하루 1회).
+    async def _is_open_today(self, now: datetime) -> bool:
+        """오늘이 매매하는 날인지. 스케줄러와 모니터 루프가 같은 판정을 쓴다.
 
-        holidays.json은 대체공휴일이 빠지기 쉽고, 배포 서버에서는 마운트된
-        파일이 기본 8일짜리 폴백만 들고 있었다. 그 결과 휴장일에 주문을 내다
-        APBK0919로 거부당하고 청산이 영구 차단된 사고가 있었다.
+        KIS 휴장일조회로 확인된 날짜는 달력(market_calendar)에 등록되어 단일 출처가 된다.
+        미확인이면 06시 이후 조회하고, 실패하면 5분 뒤 다시 시도한다. 그동안은 로컬
+        달력으로 판단한다.
         """
         date_str = now.strftime("%Y%m%d")
-        if self._open_day_checked_for == date_str:
-            return self._open_day_cache if self._open_day_cache is not None else local_guess
+        if self._trading_halted_on == date_str:
+            return False
 
-        if now.hour < 6:  # 야간 불필요 호출 방지
-            return local_guess
+        if not market_calendar.is_confirmed(now) and now.hour >= 6:
+            due = (self._open_day_query_at is None
+                   or (now - self._open_day_query_at).total_seconds() >= 300)
+            if due:
+                self._open_day_query_at = now
+                await self._refresh_open_days(now)
+        return market_calendar.is_trading_day(now)
 
-        self._open_day_checked_for = date_str
+    async def _refresh_open_days(self, now: datetime) -> Optional[bool]:
+        """KIS 에서 개장일을 받아 달력에 등록. 오늘의 개장 여부를 반환 (실패 시 None)."""
+        date_str = now.strftime("%Y%m%d")
+        local_guess = market_calendar.is_trading_day(now)
         try:
             kis_open = await self.api_client.is_open_day(date_str)
         except Exception as e:
             logger.warning(f"[개장일검증] 조회 예외: {e}")
-            kis_open = None
-        self._open_day_cache = kis_open
-
+            return None
         if kis_open is None:
-            return local_guess
+            return None
+
+        market_calendar.register_open_days(self.api_client.open_day_calendar)
         if kis_open != local_guess:
-            logger.warning(
-                f"[개장일검증] 불일치 {date_str}: 로컬={local_guess} KIS={kis_open} "
-                f"→ KIS 기준 적용. holidays.json 갱신 필요"
-            )
+            logger.warning(f"[개장일검증] 불일치 {date_str}: 로컬={local_guess} KIS={kis_open} → KIS 기준 적용")
             await self.notifier.send_message(
                 f"⚠️ <b>개장일 판정 불일치</b> {date_str}\n"
                 f"로컬 달력: {'개장' if local_guess else '휴장'} / "
                 f"KIS: {'개장' if kis_open else '휴장'}\n"
-                f"KIS 기준으로 진행합니다. holidays.json 갱신이 필요합니다."
+                f"KIS 기준으로 진행합니다."
             )
         return kis_open
 
@@ -253,13 +298,7 @@ class AsyncAutoTrader:
 
             # 휴장일(주말/공휴일) 판단
             # 단, 토큰 갱신(07:30)은 주말에도 수행할 수 있도록 조건 분리
-            from utils.utils import is_trading_day
-            market_is_open_today = await self._confirm_open_day(now, is_trading_day())
-
-            # 06:00 — 자동 파라미터 최적화 (토요일 or 50거래 누적)
-            if now_str == "06:00" and self._should_trigger("06:00_optimize"):
-                self._mark_triggered("06:00_optimize")
-                await self._run_auto_optimize()
+            market_is_open_today = await self._is_open_today(now)
 
             # 07:00 — 시장 리스크 재평가
             if now_str == "07:00" and self._should_trigger("07:00"):
@@ -267,9 +306,11 @@ class AsyncAutoTrader:
                 if market_is_open_today:
                     logger.info("07:00 시장 리스크 평가 시작...")
                     await self.risk_manager.assess_market_risk()
-                    # 에이전트 일별 리셋 (GAP-06: 오버나이트 포지션 holdings 전달)
-                    self.coordinator.reset_daily(current_holdings=self.strategy.holdings)
+                    if self.coordinator:
+                        # 에이전트 일별 리셋 (GAP-06: 오버나이트 포지션 holdings 전달)
+                        self.coordinator.reset_daily(current_holdings=self.strategy.holdings)
                     self.strategy.reset_daily()
+                    self._exit_fail_counts.clear()
                 else:
                     logger.info("휴장일이므로 07:00 시장 리스크 평가를 건너뜁니다.")
 
@@ -282,6 +323,10 @@ class AsyncAutoTrader:
                     logger.info("API 토큰 갱신 완료")
                 else:
                     logger.error("API 토큰 갱신 실패")
+                    await self.notifier.send_message(
+                        "🚨 <b>API 토큰 갱신 실패</b>\n07:30 선제 갱신이 실패했습니다. "
+                        "기존 토큰이 만료되면 주문·시세 조회가 멈춥니다."
+                    )
                     
             # 휴장일이면 이 시간대 이후의 주식 매매 관련 스케줄은 검사하지 않음
             if not market_is_open_today:
@@ -364,13 +409,10 @@ class AsyncAutoTrader:
     async def _monitor_loop(self):
         """보유 포지션 청산 조건 + 연속 시그널 모니터링 (장 중 매 10초)."""
         while self.running:
-            from utils.utils import is_trading_day
-
             now = datetime.now()
-            # 휴장일이면 대기. 개장일 판정은 스케줄러와 동일한 캐시를 공유하므로
-            # APBK0919로 당일 매매 중단이 결정되면 이 루프도 함께 멈춘다.
-            # (is_market_open()을 쓰면 중단 결정이 반영되지 않아 10초마다 재시도한다)
-            if not await self._confirm_open_day(now, is_trading_day()):
+            # 휴장일이면 대기. 스케줄러와 같은 판정을 쓰므로 당일 매매 중단이 결정되면
+            # 이 루프도 함께 멈춘다.
+            if not await self._is_open_today(now):
                  await asyncio.sleep(60)
                  continue
 
@@ -380,7 +422,7 @@ class AsyncAutoTrader:
                 await self._check_exit_conditions()
 
                 # 1.1 CB Level 3/4 강제 청산 (P3: 누진적 서킷브레이커)
-                if hasattr(self, 'coordinator') and self.coordinator:
+                if self.coordinator:
                     if self.coordinator.risk.should_close_all():
                         for t in list(self.strategy.holdings.keys()):
                             logger.critical(f"🚨 [CB4] 전 포지션 청산: {t}")
@@ -554,6 +596,9 @@ class AsyncAutoTrader:
 
     async def _opening_validation_and_entry(self):
         """09:05 시초가 갭 검증 후 진입."""
+        if not config.INTRADAY_ENTRY_ENABLED:
+            logger.info("시초가 매수 건너뜀 (intraday_entry_enabled=false)")
+            return
         logger.info("시초가 검증 매수 로직 실행")
         try:
             if not self.candidate_stocks:
@@ -563,7 +608,7 @@ class AsyncAutoTrader:
                 if not self.candidate_stocks:
                     return
 
-            await self.strategy.update_holdings()
+            await self._sync_holdings()
 
             # 오버나이트 제외, 갭 필터 적용
             daytrade_candidates = [c for c in self.candidate_stocks if c.get("reason") != "Overnight"]
@@ -579,6 +624,9 @@ class AsyncAutoTrader:
 
     async def _intraday_screening_and_entry(self):
         """10:30/13:30 장중 모멘텀 스크리닝 & 추가 매수."""
+        if not config.INTRADAY_ENTRY_ENABLED:
+            logger.info("장중 스크리닝 건너뜀 (intraday_entry_enabled=false)")
+            return
         logger.info("장중 모멘텀 스크리닝 시작")
         try:
             regime = self._get_current_market_regime()
@@ -586,12 +634,9 @@ class AsyncAutoTrader:
                 ["KOSPI", "KOSDAQ"], is_intraday=True, market_regime=regime
             )
 
-            # 기존 후보에 신규 합산 (중복 제거, 점수 내림차순)
-            existing_tickers = {c["ticker"] for c in self.candidate_stocks}
-            for c in new_candidates:
-                if c["ticker"] not in existing_tickers:
-                    self.candidate_stocks.append(c)
-                    existing_tickers.add(c["ticker"])
+            # 같은 종목은 최신 스크리닝 결과로 교체한다. 예전 점수를 남겨 두면 10:30 의
+            # 점수로 14:50 에 매수하게 된다. 이번에 통과하지 못한 종목은 후보에서 뺀다.
+            self.candidate_stocks = list(new_candidates)
 
             self.candidate_stocks.sort(key=lambda x: x.get("score", 0), reverse=True)
             self.strategy.set_candidate_stocks(self.candidate_stocks)
@@ -615,7 +660,7 @@ class AsyncAutoTrader:
                 )
                 await self.notifier.send_message(msg)
 
-            await self.strategy.update_holdings()
+            await self._sync_holdings()
             held = set(self.strategy.holdings.keys())
             targets = [
                 c for c in self.candidate_stocks
@@ -659,7 +704,7 @@ class AsyncAutoTrader:
             )
             await self.notifier.send_message(msg)
 
-            await self.strategy.update_holdings()
+            await self._sync_holdings()
             held = set(self.strategy.holdings.keys())
             targets = [c for c in overnight_only if c["ticker"] not in held]
             await self._execute_entries(targets[:config.MAX_STOCKS], context="오버나이트 진입")
@@ -675,8 +720,10 @@ class AsyncAutoTrader:
     async def _continuous_signal_check(self):
         """기존 후보 종목의 진입 타이밍을 5분마다 재확인하여 즉시 매수.
         Issue #24-C3: 매 15분마다 거래량 급증 종목 신규 탐색 추가."""
+        if not config.INTRADAY_ENTRY_ENABLED:
+            return
         try:
-            await self.strategy.update_holdings()
+            await self._sync_holdings()
             held = set(self.strategy.holdings.keys())
             remaining_slots = self.strategy.max_stocks - len(held)
             if remaining_slots <= 0:
@@ -699,12 +746,12 @@ class AsyncAutoTrader:
                                 try:
                                     result = await self.screener._process_ticker(
                                         ticker, market, is_overnight_window=False,
-                                        is_intraday=True, market_regime=regime
+                                        is_intraday=True,
                                     )
                                     if result and result.get("ticker") and result.get("score", 0) > 0:
                                         return result
                                 except Exception as e:
-                                    logger.debug(f"[신규 포착] {ticker} 스코어링 실패: {e}")
+                                    logger.warning(f"[신규 포착] {ticker} 스코어링 실패: {e}")
                                 return None
 
                         # 2026-04-24: 기존 [:10] 캡으로 49종 발견해도 10개만 스코어링 → 대부분 기회 상실.
@@ -752,15 +799,9 @@ class AsyncAutoTrader:
             for i in range(0, len(targets), 5):
                 batch = targets[i:i+5]
                 async def check_one(c, _regime=regime):
-                    import time as _time
                     ticker = c.get("ticker", "")
-                    # 30분 재매수 쿨다운 체크
-                    recently_sold = getattr(self.strategy, "_recently_sold", {})
-                    if ticker in recently_sold:
-                        elapsed = _time.time() - recently_sold[ticker]
-                        if elapsed < 1800:
-                            logger.debug(f"[연속 시그널] {ticker}: 매도 후 재매수 쿨다운 ({int(elapsed/60)}분 경과, 30분 필요)")
-                            return None
+                    if self.strategy.in_rebuy_cooldown(ticker) is not None:
+                        return None
                     try:
                         ohlcv = await self.api_client.get_ohlcv(ticker, count=30)
                         if ohlcv is None or ohlcv.empty:
@@ -802,18 +843,13 @@ class AsyncAutoTrader:
         regime = self._get_current_market_regime()
 
         async def check_one(c: dict, _regime=regime):
-            import time as _time
             ticker = c.get("ticker", "")
             if not ticker:
                 return (c, "티커 없음")
-            # 30분 재매수 쿨다운 체크
-            recently_sold = getattr(self.strategy, "_recently_sold", {})
-            if ticker in recently_sold:
-                elapsed = _time.time() - recently_sold[ticker]
-                if elapsed < 1800:
-                    return (c, f"매도 후 쿨다운({int(elapsed/60)}분 경과)")
-            # 오버나이트 후보: 스크리닝(close_position≥0.7)에서 이미 검증 완료
-            # Strategy A~E(모멘텀/눌림)는 인트라데이 조건 → 오버나이트에 부적합
+            cooldown_min = self.strategy.in_rebuy_cooldown(ticker)
+            if cooldown_min is not None:
+                return (c, f"매도 후 쿨다운({cooldown_min}분 경과)")
+            # 오버나이트 후보는 스크리닝의 종가 위치·수급 조건으로 이미 검증됨.
             if c.get("reason") == "Overnight":
                 return (c, None)
             try:
@@ -850,140 +886,110 @@ class AsyncAutoTrader:
                 await self.notifier.send_message(msg)
             return
 
-        # ── 에이전트 시스템: 추가 신뢰도 필터 ─────────────────────────────
-        agent_decisions = {}
-        try:
-            decisions = await self.coordinator.generate_buy_decisions(
-                approved, self.strategy.holdings
-            )
-            for d in decisions:
-                agent_decisions[d.ticker] = d
-            if decisions:
-                logger.info(
-                    f"[AgentCoordinator] {len(decisions)}개 매수 결정 "
-                    f"({[d.ticker for d in decisions]})"
+        # ── 에이전트 필터 (활성화된 경우만) ─────────────────────────────────
+        # 결과는 세 가지다: None = 의견 없음(오류 포함, 필터 미적용),
+        # 빈 dict = 전원 거부, 그 외 = 승인 종목. 예전에는 빈 결과를 "의견 없음"으로
+        # 취급해 서킷브레이커가 전원 거부하면 오히려 전원 매수됐다.
+        agent_decisions: Optional[dict] = None
+        if self.coordinator:
+            try:
+                decisions = await self.coordinator.generate_buy_decisions(
+                    approved, self.strategy.holdings
                 )
-            else:
-                # Bug #6 visibility (2026-04-24): 코디네이터가 후보 전체를 거부한 경우 명시
-                logger.info(
-                    f"[AgentCoordinator] 후보 {len(approved)}개 전원 거부 "
-                    f"(alpha_conf/score/sentiment/risk 7단계 필터)"
-                )
-        except Exception as e:
-            # 기존: logger.debug — 코디네이터 크래시가 조용히 숨겨짐.
-            # Bug #6 visibility: 경고 레벨 + 스택트레이스로 승격
-            logger.warning(
-                f"에이전트 결정 생성 오류 (fallback to legacy logic): {e}",
-                exc_info=True,
-            )
-
-        # 에이전트 거부 종목 집계
-        agent_rejected = []
-        if agent_decisions:
-            for c in approved:
-                ticker = c.get("ticker", "")
-                if ticker and ticker not in agent_decisions:
-                    agent_rejected.append((c.get("name", ticker), ticker, "에이전트 리스크 필터"))
-                    # Bug #6 visibility: debug → info (Intraday 사일런트 차단 추적)
-                    logger.info(
-                        f"[AgentCoordinator] {ticker} 에이전트 거부 "
-                        f"(reason={c.get('reason','?')} score={c.get('score',0)})"
-                    )
+                agent_decisions = {d.ticker: d for d in decisions}
+                logger.info(f"[AgentCoordinator] 후보 {len(approved)}개 중 "
+                            f"{len(agent_decisions)}개 승인 {list(agent_decisions)}")
+            except Exception as e:
+                logger.warning(f"에이전트 결정 생성 오류 — 필터 없이 진행: {e}", exc_info=True)
 
         success_tickers = []   # (name, ticker)
         failed_tickers = []    # (name, ticker, reason)
+        rejected_tickers = []  # (name, ticker, reason) — 리스크 한도 등 내부 사유
+        agent_rejected = []
 
         for c in approved:
-            # 포트폴리오 슬롯 체크: max_stocks 도달 시 중단
-            if len(self.strategy.holdings) >= config.MAX_STOCK_COUNT:
-                logger.info(f"[매수중단] 최대 보유 종목 수 도달 ({config.MAX_STOCK_COUNT})")
-                break
-
             ticker = c.get("ticker", "")
             reason = c.get("reason", "Momentum")
             name = c.get("name", ticker)
-            agent_dec = agent_decisions.get(ticker)
 
-            # 에이전트가 이 종목을 거부했으면 건너뜀 (상세 로그는 위에서 이미 기록됨)
-            if agent_decisions and ticker not in agent_decisions:
+            if agent_decisions is not None and ticker not in agent_decisions:
+                agent_rejected.append((name, ticker, "에이전트 필터"))
                 continue
 
             try:
-                # G5: 에이전트가 Kelly 기반 수량을 계산했으면 전달
-                agent_qty = agent_dec.quantity if agent_dec and agent_dec.quantity > 0 else 0
-                result = await self.strategy.entry(ticker, quantity=agent_qty, reason=reason)
-                if result and result.get("rt_cd") == "0":
+                result = await self.strategy.entry(ticker, reason=reason, name=name)
+                if result.get("rt_cd") == "0":
+                    holding = self.strategy.holdings.get(ticker, {})
                     score = c.get("score", 0)
                     gap = c.get("opening_gap", None)
                     gap_str = f" | 갭: {gap:+.2%}" if gap is not None else ""
-                    # Bug #4 fix (2026-04-24): 실제 체결가는 strategy.holdings 에 저장되어 있음.
-                    # 기존에는 screener 후보 dict의 current_price/close 를 썼는데 대부분 0이었음 →
-                    # DB BUY 레코드 price 컬럼이 전량 0으로 오염됨.
-                    filled_price = self.strategy.holdings.get(ticker, {}).get("buy_price", 0)
-                    buy_price = filled_price or c.get("current_price", 0) or c.get("close", 0)
-                    filled_qty = (
-                        self.strategy.holdings.get(ticker, {}).get("quantity", 0)
-                        or agent_qty
-                    )
-                    invest_amt = int(float(buy_price) * filled_qty) if buy_price and filled_qty else 0
-                    invest_str = f"\n투자금: {invest_amt:,.0f}원" if invest_amt > 0 else ""
-                    conf_str = f" | 신뢰도: {agent_dec.combined_confidence:.0%}" if agent_dec else ""
-                    strategy_str = agent_dec.strategy if agent_dec else reason
+                    buy_price = holding.get("buy_price", 0)
+                    filled_qty = holding.get("quantity", 0)
+                    invest_amt = int(float(buy_price) * filled_qty)
 
                     await self.notifier.send_message(
-                        f"📈 <b>매수 체결</b> {name} ({ticker})\n"
-                        f"전략: {strategy_str} | 점수: {score:.1f}{conf_str}\n"
-                        f"체결가: {float(buy_price):,.0f}원 | 수량: {filled_qty}주{gap_str}"
-                        f"{invest_str}"
+                        f"📈 <b>매수 주문 접수</b> {name} ({ticker})\n"
+                        f"전략: {reason} | 점수: {score:.1f}\n"
+                        f"기준가: {float(buy_price):,.0f}원 | 수량: {filled_qty}주{gap_str}\n"
+                        f"투자금: {invest_amt:,.0f}원"
                     )
                     success_tickers.append((name, ticker))
-                    try:
-                        self.coordinator.on_trade_executed(
-                            ticker=ticker,
-                            action="BUY",
-                            strategy=strategy_str,
-                            price=float(buy_price),
-                            quantity=filled_qty,
-                        )
-                    except Exception:
-                        pass
+                    if self.coordinator:
+                        try:
+                            self.coordinator.on_trade_executed(
+                                ticker=ticker, action="BUY", strategy=reason,
+                                price=float(buy_price), quantity=filled_qty,
+                            )
+                        except Exception as e:
+                            logger.warning(f"에이전트 매수 피드백 오류 {ticker}: {e}")
 
-                    # DB 저장 (비동기, 실패해도 매매 계속)
                     trade_id = await self.db.save_trade_buy(
                         ticker=ticker,
                         name=name,
                         price=float(buy_price),
                         quantity=filled_qty,
-                        strategy=strategy_str,
+                        strategy=reason,
                         score=float(score),
-                        market_regime=self._get_current_market_regime(),
-                        agent_confidence=agent_dec.combined_confidence if agent_dec else 0.0,
+                        market_regime=regime,
                     )
-                    self._buy_trade_ids[ticker] = trade_id
+                    self.strategy.set_buy_trade_id(ticker, trade_id)
+                elif result.get("_rejected"):
+                    rejected_tickers.append((name, ticker, result.get("msg1", "")))
+                elif result.get("_unconfirmed"):
+                    failed_tickers.append((name, ticker, "응답 미수신 — 접수 여부 미확인"))
+                    await self.notifier.send_message(
+                        f"🚨 <b>매수 주문 접수 여부 미확인</b> {name} ({ticker})\n"
+                        f"주문 전송 후 응답을 받지 못했습니다. 재전송하지 않았습니다.\n"
+                        f"체결됐다면 다음 잔고 동기화에서 포지션으로 잡힙니다."
+                    )
                 else:
-                    r = result or {}
-                    err_msg = r.get("msg1") or r.get("msg_cd") or r.get("message") or "응답 없음"
-                    err_msg = err_msg[:50]
-                    logger.error(f"[매수실패 상세] {ticker}: rt_cd={r.get('rt_cd')} msg_cd={r.get('msg_cd')} msg1={r.get('msg1')}")
+                    err_msg = (result.get("msg1") or result.get("msg_cd") or "응답 없음")[:50]
+                    logger.error(f"[매수실패 상세] {ticker}: rt_cd={result.get('rt_cd')} "
+                                 f"msg_cd={result.get('msg_cd')} msg1={result.get('msg1')}")
                     failed_tickers.append((name, ticker, err_msg))
             except Exception as e:
-                logger.error(f"매수 오류 {ticker}: {e}")
+                logger.error(f"매수 오류 {ticker}: {e}", exc_info=True)
                 failed_tickers.append((name, ticker, str(e)[:30]))
 
         # ── 진입 요약 메시지 ──────────────────────────────────────────────
         if context:
-            total = len(success_tickers) + len(failed_tickers) + len(agent_rejected) + len(timing_rejected)
+            total = (len(success_tickers) + len(failed_tickers) + len(rejected_tickers)
+                     + len(agent_rejected) + len(timing_rejected))
             if total == 0:
                 return
             msg = f"📊 <b>[{context}] 진입 요약</b>\n{'─' * 22}\n"
             if success_tickers:
-                msg += f"✅ <b>매수 성공 {len(success_tickers)}종목</b>\n"
+                msg += f"✅ <b>매수 접수 {len(success_tickers)}종목</b>\n"
                 for sname, sticker in success_tickers:
                     msg += f"  • {sname}({sticker})\n"
             if failed_tickers:
                 msg += f"\n❌ <b>주문 실패 {len(failed_tickers)}종목</b>\n"
                 for fname, fticker, freason in failed_tickers[:5]:
                     msg += f"  • {fname}({fticker}): {freason}\n"
+            if rejected_tickers:
+                msg += f"\n🛡️ <b>리스크 한도 {len(rejected_tickers)}종목</b>\n"
+                for rname, rticker, rreason in rejected_tickers[:6]:
+                    msg += f"  • {rname}({rticker}): {rreason}\n"
             if agent_rejected:
                 msg += f"\n🤖 <b>에이전트 필터 {len(agent_rejected)}종목</b>\n"
                 for aname, aticker, _ in agent_rejected[:5]:
@@ -1000,155 +1006,146 @@ class AsyncAutoTrader:
 
     async def _check_exit_conditions(self):
         """보유 포지션 청산 조건 체크 및 실행."""
-        if not self.strategy.holdings:
+        # 보유 목록이 비어 있어도 동기화는 한다. 재시작 직후나 외부 체결로 생긴 포지션을
+        # 여기서 잡지 못하면 손절 감시 없이 방치된다.
+        await self._sync_holdings()
+
+        tickers = self.strategy.open_tickers()
+        if not tickers:
             return
 
-        # 청산 전 실제 보유 잔고 동기화 (stale holdings 방지 → "청산 실패" 감소)
-        try:
-            await self.strategy.update_holdings()
-        except Exception:
-            pass  # 동기화 실패해도 로컬 holdings로 진행
-
-        # 매도 차단(거래정지/매매불가) 종목은 청산 판단 대상에서 제외한다.
-        # exit()이 무조건 None을 반환하므로 신호만 10초마다 영구 반복되던 원인.
-        blocked = getattr(self.strategy, "_unsellable_tickers", set())
-        sellable = {t: h for t, h in self.strategy.holdings.items() if t not in blocked}
-        if not sellable:
-            return
-
-        # ── 에이전트 청산 신호 수집 ──────────────────────────────────────────
+        # ── 에이전트 청산 신호 (활성화된 경우만) ─────────────────────────────
         agent_sell_set: set = set()
-        try:
-            sell_decisions = await self.coordinator.generate_sell_decisions(sellable)
-            for d in sell_decisions:
-                if d.ticker:
-                    agent_sell_set.add(d.ticker)
-                    logger.info(f"[AgentCoordinator] 청산 신호: {d.ticker} ({d.reason})")
-        except Exception as e:
-            logger.debug(f"에이전트 청산 신호 오류: {e}")
+        if self.coordinator:
+            try:
+                open_holdings = {t: self.strategy.holdings[t] for t in tickers}
+                for d in await self.coordinator.generate_sell_decisions(open_holdings):
+                    if d.ticker:
+                        agent_sell_set.add(d.ticker)
+                        logger.info(f"[AgentCoordinator] 청산 신호: {d.ticker} ({d.reason})")
+            except Exception as e:
+                logger.warning(f"에이전트 청산 신호 오류: {e}")
 
         regime = self._get_current_market_regime()
-        for ticker in list(sellable.keys()):
+        for ticker in tickers:
             try:
-                # 기존 전략 청산 조건 체크 (체제별 손익비 적용)
                 should_exit, reason = await self.strategy.check_exit_condition(ticker, market_regime=regime)
-
-                # 에이전트가 추가 청산 신호를 내렸으면 보강
                 if not should_exit and ticker in agent_sell_set:
-                    should_exit = True
-                    reason = "에이전트 리스크 청산"
+                    should_exit, reason = True, "에이전트 리스크 청산"
+                if not should_exit:
+                    continue
 
-                if should_exit:
-                    holding = self.strategy.holdings.get(ticker, {})
-                    buy_price = holding.get("buy_price", 0)
-                    current_price = holding.get("current_price", 0)
-                    profit_pct = (current_price / buy_price - 1) if buy_price > 0 and current_price > 0 else 0
-                    profit_emoji = "🟢" if profit_pct >= 0 else "🔴"
-                    stock_name = holding.get("name", ticker)
+                holding = dict(self.strategy.holdings.get(ticker, {}))
+                logger.info(f"[청산신호] {ticker}: {reason}")
+                result = await self.strategy.exit(ticker, reason=reason)
 
-                    logger.info(f"[청산신호] {ticker}: {reason}")
-                    result = await self.strategy.exit(ticker, reason=reason)
-                    if result and result.get("rt_cd") == "0":
-                        # 성공 — 수익/손실 금액 표시
-                        qty = holding.get("quantity", 0)
-                        pnl_amount = (current_price - buy_price) * qty if buy_price else 0
-                        strategy_name = holding.get("reason", holding.get("strategy", "Momentum"))
-                        buy_time_raw = holding.get("entry_time", "")
-                        hold_str = ""
-                        if buy_time_raw:
-                            try:
-                                if isinstance(buy_time_raw, datetime):
-                                    bt = buy_time_raw
-                                else:
-                                    bt = datetime.strptime(str(buy_time_raw)[:19], "%Y-%m-%d %H:%M:%S")
-                                hold_mins = int((datetime.now() - bt).total_seconds() / 60)
-                                hold_str = (
-                                    f" | 보유: {hold_mins // 60}h{hold_mins % 60}m"
-                                    if hold_mins >= 60 else f" | 보유: {hold_mins}분"
-                                )
-                            except Exception:
-                                pass
-                        await self.notifier.send_message(
-                            f"📤 <b>청산 체결</b> {stock_name} ({ticker})\n"
-                            f"{profit_emoji} 수익률: <b>{profit_pct:+.2%}</b> | {qty}주{hold_str}\n"
-                            f"손익: {pnl_amount:+,.0f}원\n"
-                            f"매수가: {buy_price:,.0f}원 → 청산가: {current_price:,.0f}원\n"
-                            f"전략: {strategy_name} | 사유: {reason}"
-                        )
-                        # 실패 카운터 초기화 + 자동 최적화 카운터 증가
-                        self._exit_fail_counts.pop(ticker, None)
-                        self._increment_trade_counter()
-                        # 에이전트에 청산 결과 피드백
-                        try:
-                            self.coordinator.on_trade_executed(
-                                ticker=ticker,
-                                action="SELL",
-                                strategy=strategy_name,
-                                price=float(current_price),
-                                quantity=holding.get("quantity", 0),
-                                pnl_ratio=profit_pct,
-                                pnl_amount=pnl_amount,
-                            )
-                        except Exception:
-                            pass
-                        # DB 저장
-                        await self.db.save_trade_sell(
-                            ticker=ticker,
-                            name=stock_name,
-                            price=float(current_price),
-                            quantity=holding.get("quantity", 0),
-                            buy_price=float(buy_price),
-                            pnl_amount=float(pnl_amount),
-                            pnl_ratio=float(profit_pct),
-                            reason=reason,
-                            buy_trade_id=self._buy_trade_ids.pop(ticker, None),
-                            market_regime=self._get_current_market_regime(),
-                            strategy=strategy_name,
-                        )
-                    elif result is None:
-                        # can_trade() 거부 — 시장 시간 외 또는 리스크 차단 (정상)
-                        logger.debug(f"[청산거부] {ticker}: 리스크 매니져 또는 시장 시간 외")
-                    else:
-                        # API 오류 — 연속 실패 추적
-                        err_msg = result.get("msg1", "unknown")
-                        err_code = result.get("msg_cd", "")
-                        logger.error(f"[청산실패] {ticker}: {err_code} {err_msg}")
-
-                        # APBK0919 = KIS 기준 장운영일자 불일치 → 우리 달력이 틀렸다.
-                        # 계속 주문을 시도하는 대신 당일 매매를 중단하고 경보한다.
-                        if err_code == "APBK0919":
-                            self._open_day_cache = False
-                            logger.error(
-                                "[개장일오류] KIS가 장운영일자 불일치를 반환 → "
-                                "당일 매매 중단. holidays.json 갱신 필요"
-                            )
-                            await self.notifier.send_message(
-                                f"🚨 <b>개장일 판정 오류</b>\n"
-                                f"{ticker} 주문이 APBK0919(장운영일자 상이)로 거부됨.\n"
-                                f"휴장일에 매매를 시도한 것으로 판단 → 당일 매매를 중단합니다.\n"
-                                f"holidays.json 갱신이 필요합니다."
-                            )
-                            return
-
-                        self._exit_fail_counts[ticker] = self._exit_fail_counts.get(ticker, 0) + 1
-                        fail_cnt = self._exit_fail_counts[ticker]
-
-                        if fail_cnt >= 3:
-                            # 실제로 이미 매도됐거나 잔고 불일치 가능성 → 로컬 제거
-                            logger.warning(
-                                f"[청산실패] {ticker} {fail_cnt}회 연속 실패 "
-                                f"→ 로컬 holdings 강제 제거 (잔고 확인 필요)"
-                            )
-                            self.strategy.holdings.pop(ticker, None)
-                            self._exit_fail_counts.pop(ticker, None)
-                            await self.notifier.send_message(
-                                f"🚨 <b>청산 이상</b> {stock_name} ({ticker})\n"
-                                f"{fail_cnt}회 연속 API 오류 → 잔고 확인 요망\n"
-                                f"오류: {err_code} {err_msg}"
-                            )
-                        # 1~2회 실패: 텔레그램 없이 재시도 대기
+                if result is None:
+                    continue  # 매도 불가 시간·미체결 주문 대기 등 — 다음 틱에 다시 판단
+                if result.get("rt_cd") == "0":
+                    self._exit_fail_counts.pop(ticker, None)
+                    await self._on_sell_accepted(ticker, holding, reason, regime)
+                elif result.get("_unconfirmed"):
+                    await self.notifier.send_message(
+                        f"🚨 <b>매도 주문 접수 여부 미확인</b> {holding.get('name', ticker)} ({ticker})\n"
+                        f"주문 전송 후 응답을 받지 못했습니다. 재전송하지 않았습니다.\n"
+                        f"잔고에 매도가능수량이 남아 있으면 30초 뒤 다시 시도합니다."
+                    )
+                else:
+                    halted = await self._on_sell_failed(ticker, holding, result)
+                    if halted:
+                        return
             except Exception as e:
-                logger.error(f"청산 조건 체크 오류 {ticker}: {e}")
+                logger.error(f"청산 조건 체크 오류 {ticker}: {e}", exc_info=True)
+
+    async def _on_sell_accepted(self, ticker: str, holding: dict, reason: str, regime: str):
+        """매도 주문 접수 후 기록·알림. 가격은 접수 시점 시세 기준의 추정치다."""
+        buy_price = holding.get("buy_price", 0)
+        sold = next((h for h in reversed(self.strategy.order_history)
+                     if h["action"] == "SELL" and h["ticker"] == ticker), {})
+        sell_price = sold.get("price") or holding.get("current_price", 0)
+        qty = sold.get("quantity") or holding.get("quantity", 0)
+        # 수수료·거래세를 뺀 값. 승패 판정과 일일 손실 한도가 이 값을 쓴다.
+        pnl_amount, profit_pct = net_pnl(buy_price, sell_price, qty)
+        stock_name = holding.get("name", ticker)
+        strategy_name = holding.get("reason", "Standard")
+
+        hold_mins = int((datetime.now() - holding["entry_time"]).total_seconds() / 60) \
+            if holding.get("entry_time") else 0
+        hold_str = f"{hold_mins // 60}h{hold_mins % 60}m" if hold_mins >= 60 else f"{hold_mins}분"
+
+        # 일일 손실 한도가 이 값을 읽는다.
+        self.risk_manager.record_trade_pnl(pnl_amount)
+
+        await self.notifier.send_message(
+            f"📤 <b>청산 주문 접수</b> {stock_name} ({ticker})\n"
+            f"{'🟢' if profit_pct >= 0 else '🔴'} 수익률: <b>{profit_pct:+.2%}</b> | {qty}주 | 보유: {hold_str}\n"
+            f"손익(비용 차감, 추정): {pnl_amount:+,.0f}원\n"
+            f"매수가: {buy_price:,.0f}원 → 기준가: {sell_price:,.0f}원\n"
+            f"전략: {strategy_name} | 사유: {reason}"
+        )
+        if self.coordinator:
+            try:
+                self.coordinator.on_trade_executed(
+                    ticker=ticker, action="SELL", strategy=strategy_name,
+                    price=float(sell_price), quantity=qty,
+                    pnl_ratio=profit_pct, pnl_amount=pnl_amount,
+                )
+            except Exception as e:
+                logger.warning(f"에이전트 청산 피드백 오류 {ticker}: {e}")
+
+        await self.db.save_trade_sell(
+            ticker=ticker,
+            name=stock_name,
+            price=float(sell_price),
+            quantity=qty,
+            buy_price=float(buy_price),
+            pnl_amount=float(pnl_amount),
+            pnl_ratio=float(profit_pct),
+            reason=reason,
+            buy_trade_id=holding.get("buy_trade_id"),
+            market_regime=regime,
+            strategy=strategy_name,
+        )
+
+    async def _on_sell_failed(self, ticker: str, holding: dict, result: dict) -> bool:
+        """매도 실패 처리. 당일 매매를 중단했으면 True."""
+        err_msg = result.get("msg1", "unknown")
+        err_code = result.get("msg_cd", "")
+        stock_name = holding.get("name", ticker)
+        logger.error(f"[청산실패] {ticker}: {err_code} {err_msg}")
+
+        # APBK0919 = KIS 가 본 장운영일자가 주문일과 다르다 → 휴장일 의심.
+        # 주문 오류만으로 달력을 덮지 않고 휴장일조회로 확인한 뒤에만 중단한다.
+        # 개장일로 확인되면 일시적 오류로 보고 일반 실패로 처리한다 (손절 감시 유지).
+        if err_code == "APBK0919":
+            now = datetime.now()
+            kis_open = await self._refresh_open_days(now)
+            if kis_open is not True:
+                self._trading_halted_on = now.strftime("%Y%m%d")
+                confirmed = "휴장일로 확인됨" if kis_open is False else "휴장일조회 실패로 확인 불가"
+                logger.error(f"[개장일오류] APBK0919 수신, {confirmed} → 당일 매매 중단")
+                await self.notifier.send_message(
+                    f"🚨 <b>당일 매매 중단</b>\n"
+                    f"{stock_name}({ticker}) 주문이 APBK0919(장운영일자 상이)로 거부됐고 "
+                    f"{confirmed}."
+                )
+                return True
+
+        fail_cnt = self._exit_fail_counts.get(ticker, 0) + 1
+        self._exit_fail_counts[ticker] = fail_cnt
+        if fail_cnt >= 3:
+            # 포지션을 로컬에서 지우지 않는다. 지워도 다음 동기화가 잔고에서 다시 넣고,
+            # 그때 메타데이터(전략·매수 시각)만 잃는다. 당일 재시도만 막고 알린다.
+            self.strategy._unsellable_tickers.add(ticker)
+            self._exit_fail_counts.pop(ticker, None)
+            logger.warning(f"[청산실패] {ticker} {fail_cnt}회 연속 실패 → 당일 매도 재시도 중단")
+            await self.notifier.send_message(
+                f"🚨 <b>청산 실패</b> {stock_name} ({ticker})\n"
+                f"{fail_cnt}회 연속 실패로 오늘은 재시도하지 않습니다. 포지션은 그대로 남아 있습니다.\n"
+                f"오류: {err_code} {err_msg}\n"
+                f"직접 확인이 필요합니다. 내일 장 시작 전 차단이 풀립니다."
+            )
+        return False
 
     # ------------------------------------------------------------------ #
     # 스크리닝 결과 저장/복원
@@ -1194,94 +1191,6 @@ class AsyncAutoTrader:
                 )
         except Exception as e:
             logger.error(f"스크리닝 결과 복원 오류: {e}")
-
-    # ------------------------------------------------------------------ #
-    # 자동 파라미터 최적화 (데이터 누적 시 자동 실행)
-    # ------------------------------------------------------------------ #
-
-    def _increment_trade_counter(self):
-        """매매 완료 시 호출. 임계값 도달 시 자동 최적화 예약."""
-        self._trades_since_last_optimize += 1
-        if self._trades_since_last_optimize >= self._AUTO_OPTIMIZE_TRADE_THRESHOLD:
-            logger.info(f"[AutoOptimize] {self._trades_since_last_optimize}건 누적 → 자동 최적화 예약")
-
-    async def _run_auto_optimize(self):
-        """OHLCV 캐시 데이터로 베이지안 최적화 실행 후 config.yaml 자동 업데이트."""
-        today = datetime.now().strftime("%Y-%m-%d")
-        if self._last_optimize_date == today:
-            return  # 하루 1회 제한
-
-        # 조건 체크: 50거래 누적 OR 토요일
-        is_saturday = datetime.now().weekday() == self._AUTO_OPTIMIZE_DAY
-        enough_trades = self._trades_since_last_optimize >= self._AUTO_OPTIMIZE_TRADE_THRESHOLD
-
-        if not (is_saturday or enough_trades):
-            return
-
-        logger.info(f"[AutoOptimize] 시작 (사유: {'주간 정기' if is_saturday else f'{self._trades_since_last_optimize}건 누적'})")
-        await self.notifier.send_message(
-            f"🔧 <b>자동 파라미터 최적화 시작</b>\n"
-            f"사유: {'주간 정기 (토요일)' if is_saturday else f'{self._trades_since_last_optimize}건 거래 누적'}"
-        )
-
-        try:
-            # 1. OHLCV 캐시에서 데이터 로드
-            import glob
-            import pandas as pd
-            cache_dir = os.path.join("data", "backtest_cache")
-            ohlcv_data = {}
-            for csv_file in glob.glob(os.path.join(cache_dir, "*.csv")):
-                ticker = os.path.basename(csv_file).replace(".csv", "")
-                try:
-                    df = pd.read_csv(csv_file, parse_dates=["date"])
-                    if len(df) >= 60:
-                        ohlcv_data[ticker] = df
-                except Exception:
-                    continue
-
-            if len(ohlcv_data) < 5:
-                logger.warning(f"[AutoOptimize] 캐시 종목 부족 ({len(ohlcv_data)}개). 최소 5개 필요.")
-                return
-
-            # 2. 현재 체제 기반 최적화
-            regime = self._get_current_market_regime()
-            from backtest.optimizer import RegimeOptimizer
-            optimizer = RegimeOptimizer(
-                ohlcv_data=ohlcv_data,
-                regime=regime if regime != "NORMAL" else None,
-                n_trials=50,
-            )
-
-            # 3. 동기 최적화를 스레드에서 실행 (이벤트 루프 블록 방지)
-            best_params = await asyncio.to_thread(optimizer.optimize)
-
-            if not best_params:
-                logger.warning("[AutoOptimize] 최적 파라미터 없음")
-                return
-
-            # 4. config.yaml에 저장
-            await asyncio.to_thread(optimizer.save_best_params)
-
-            # 5. 카운터 리셋
-            self._trades_since_last_optimize = 0
-            self._last_optimize_date = today
-
-            # 6. 결과 알림
-            result_msg = "\n".join(f"  {k}: {v}" for k, v in best_params.items())
-            await self.notifier.send_message(
-                f"✅ <b>자동 최적화 완료</b>\n"
-                f"체제: {regime}\n"
-                f"종목: {len(ohlcv_data)}개\n"
-                f"최적 파라미터:\n<code>{result_msg}</code>\n\n"
-                f"⚠️ 다음 거래 세션부터 적용됩니다."
-            )
-            logger.info(f"[AutoOptimize] 완료: {best_params}")
-
-        except ImportError:
-            logger.warning("[AutoOptimize] optuna 미설치. pip install optuna 필요.")
-        except Exception as e:
-            logger.error(f"[AutoOptimize] 실패: {e}", exc_info=True)
-            await self.notifier.send_message(f"⚠️ <b>자동 최적화 실패</b>\n오류: {e}")
 
     # ------------------------------------------------------------------ #
     # 장 마감 리포트
@@ -1345,6 +1254,8 @@ class AsyncAutoTrader:
             # 에이전트 일별 성과 취합
             agent_report = ""
             try:
+                if not self.coordinator:
+                    raise LookupError("agents disabled")
                 daily = self.coordinator.daily_report()
                 alpha_stats = daily.get("alpha_strategies", {})
                 best_strategy = max(
@@ -1359,8 +1270,10 @@ class AsyncAutoTrader:
                     f"최고전략: {best_strategy[0]} (승률 {best_strategy[1].get('win_rate', 0):.0%})\n"
                     f"리스크: {daily.get('risk_status', {}).get('heat_level', 'N/A')}"
                 )
+            except LookupError:
+                pass
             except Exception as e:
-                logger.debug(f"에이전트 리포트 취합 오류: {e}")
+                logger.warning(f"에이전트 리포트 취합 오류: {e}")
 
             pnl_emoji = "🟢" if gross_pnl >= 0 else "🔴"
             msg = (

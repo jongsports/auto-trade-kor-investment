@@ -310,6 +310,35 @@ class TradeDatabase:
 
     # ── 조회 메서드 ───────────────────────────────────────────────────────
 
+    async def get_open_buy(self, ticker: str) -> Optional[Dict]:
+        """아직 매도로 연결되지 않은 가장 최근 매수 기록.
+
+        포지션 메타데이터 파일이 없을 때(첫 배포, 파일 유실) 잔고의 종목이 어떤
+        전략으로 언제 매수됐는지 복원하는 데 쓴다.
+        """
+        if not self._ok():
+            return None
+        try:
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT b.id, b.executed_at, b.strategy, b.price, b.name
+                    FROM trades b
+                    WHERE b.ticker = $1 AND b.action = 'BUY'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM trades s
+                          WHERE s.action = 'SELL' AND s.buy_trade_id = b.id
+                      )
+                    ORDER BY b.executed_at DESC
+                    LIMIT 1
+                    """,
+                    ticker,
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"[DB] 미청산 매수 조회 실패 {ticker}: {e}")
+            return None
+
     async def get_today_trades(self) -> List[Dict]:
         """당일 매매 내역 조회."""
         if not self._ok():
