@@ -88,7 +88,7 @@ def parse_args():
 def load_data_sample(tickers, start_date, end_date):
     """샘플 합성 데이터 생성."""
     logger.info("샘플 데이터 모드: 합성 OHLCV 생성 중...")
-    collector = BacktestDataCollector(api_client=None)
+    collector = BacktestDataCollector(api_client=None, sample=True)
     data = {}
     import numpy as np
     seed = 42

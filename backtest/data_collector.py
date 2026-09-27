@@ -15,6 +15,9 @@ import pandas as pd
 logger = logging.getLogger("backtest.data_collector")
 
 CACHE_DIR = Path("data/backtest_cache")
+# 합성 데이터는 실데이터 캐시와 섞이지 않게 따로 둔다. 같은 경로에 쓰면 이후
+# --sample 없는 실행도 합성 데이터를 "유효한 캐시"로 읽는다.
+SAMPLE_CACHE_DIR = Path("data/backtest_cache_sample")
 
 
 class BacktestDataCollector:
@@ -26,16 +29,18 @@ class BacktestDataCollector:
         data = collector.get_ohlcv("005930", "2023-01-01", "2023-12-31")
     """
 
-    def __init__(self, api_client=None):
+    def __init__(self, api_client=None, sample: bool = False):
         """
         Args:
             api_client: AsyncKisAPI 인스턴스 (None이면 캐시 전용 모드)
+            sample: True 면 합성 데이터 전용 캐시를 쓴다
         """
         self.api_client = api_client
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        self.cache_dir = SAMPLE_CACHE_DIR if sample else CACHE_DIR
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _cache_path(self, ticker: str) -> Path:
-        return CACHE_DIR / f"{ticker}.csv"
+        return self.cache_dir / f"{ticker}.csv"
 
     def _load_cache(self, ticker: str) -> Optional[pd.DataFrame]:
         path = self._cache_path(ticker)
@@ -248,6 +253,8 @@ class BacktestDataCollector:
 
     def save_sample_data(self, ticker: str, df: pd.DataFrame) -> None:
         """테스트용 샘플 데이터 저장."""
+        if self.cache_dir != SAMPLE_CACHE_DIR:
+            raise ValueError("합성 데이터는 sample=True 로 만든 수집기에만 저장할 수 있다")
         self._save_cache(ticker, df)
 
     @staticmethod

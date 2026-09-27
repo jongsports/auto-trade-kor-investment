@@ -30,6 +30,7 @@ class BacktestConfig:
     end_date: str = config.BACKTEST_END_DATE
     initial_capital: float = config.BACKTEST_INITIAL_CAPITAL
     commission: float = config.BACKTEST_COMMISSION      # 편도 수수료 (0.015%)
+    sell_tax: float = config.SELL_TAX_RATE               # 매도 거래세+농특세
     slippage: float = config.BACKTEST_SLIPPAGE          # 슬리피지 (0.01%)
     score_threshold: int = 45                            # api_test 검증: PF 1.49
     max_positions: int = 3                               # api_test 검증: 집중 투자
@@ -317,7 +318,8 @@ class BacktestEngine:
         exit_price = exit_price_raw * (1 - self.cfg.slippage)
 
         proceeds = exit_price * pos.quantity
-        commission = proceeds * self.cfg.commission
+        # 매도 비용 = 수수료 + 거래세. 세금을 빼면 왕복 비용이 5배 가까이 과소평가된다.
+        commission = proceeds * (self.cfg.commission + self.cfg.sell_tax)
         slippage_cost = exit_price_raw * pos.quantity * self.cfg.slippage
         net_proceeds = proceeds - commission
 
